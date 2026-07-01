@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Project: generated audio
+outputs/
+!outputs/.gitkeep
+
+# Env / secrets
+.env
+.env.local
+*.log
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/

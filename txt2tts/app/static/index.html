@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>txt2tts · Markdown 朗读</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>📖 txt2tts</h1>
+    <span class="subtitle">选一个 .md 文件，一键朗读成 MP3</span>
+    <span id="configBadge" class="badge badge-warn" title="MiniMax API key 状态">检查中…</span>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <h2>1. 选择文件</h2>
+      <div class="row">
+        <label class="file-picker">
+          <input type="file" id="mdFile" accept=".md,.markdown,.txt">
+          <span class="file-picker-label" id="mdFileLabel">点击选择 .md 文件…</span>
+        </label>
+        <button class="btn btn-ghost" id="loadSampleBtn" type="button">载入示例</button>
+      </div>
+      <details class="hint">
+        <summary>支持哪些文件？</summary>
+        <p>支持标准 Markdown（.md / .markdown）和纯文本（.txt）。流程：本地清洗（去 md 符号）→ <b>MiniMax M3</b> 标准化（替换 URL/代码/公式、加标点、控字数）→ MiniMax Speech 2.8 合成。</p>
+      </details>
+    </section>
+
+    <section class="card">
+      <h2>2. 选择语音</h2>
+      <div class="row">
+        <label class="select-wrap">
+          <span>语音</span>
+          <select id="voiceSelect"></select>
+        </label>
+        <label class="select-wrap narrow">
+          <span>语速 <em id="speedLabel">1.0×</em></span>
+          <input type="range" id="speedRange" min="0.5" max="2.0" step="0.1" value="1.0">
+        </label>
+        <button class="btn btn-ghost" id="refreshVoicesBtn" type="button" title="重新拉取语音列表">↻</button>
+      </div>
+      <p class="hint-inline">默认语音来自 MiniMax /v1/voices；若未配置 API key，会显示一组常见备用语音。</p>
+    </section>
+
+    <section class="card">
+      <h2>3. 预览（M3 标准化后）</h2>
+      <textarea id="cleanedPreview" readonly placeholder="选择文件后，这里会显示经 MiniMax M3 标准化后的可朗读文本…"></textarea>
+      <div class="meta"><span id="textMeta">—</span></div>
+    </section>
+
+    <section class="card">
+      <h2>4. 朗读</h2>
+      <div class="row">
+        <button class="btn btn-primary" id="synthBtn" type="button" disabled>▶ 开始朗读</button>
+        <span id="status" class="status">等待文件…</span>
+      </div>
+
+      <!-- 4-stage horizontal progress -->
+      <div id="progressWrap" class="progress-wrap" hidden>
+        <div class="step-progress" id="stepProgress">
+          <div class="step" data-stage="markdown_clean">
+            <div class="step-icon">1</div>
+            <div class="step-label">本地清洗</div>
+          </div>
+          <div class="step-bar" data-bar="markdown_clean"></div>
+          <div class="step" data-stage="llm_normalize">
+            <div class="step-icon">2</div>
+            <div class="step-label">M3 标准化</div>
+          </div>
+          <div class="step-bar" data-bar="llm_normalize"></div>
+          <div class="step" data-stage="tts_synthesize">
+            <div class="step-icon">3</div>
+            <div class="step-label">语音合成</div>
+          </div>
+          <div class="step-bar" data-bar="tts_synthesize"></div>
+          <div class="step" data-stage="audio_save">
+            <div class="step-icon">4</div>
+            <div class="step-label">保存落盘</div>
+          </div>
+        </div>
+        <div class="progress-meta">
+          <span id="progressMessage" class="progress-message">准备就绪…</span>
+          <span id="progressPercent" class="progress-percent">0%</span>
+        </div>
+        <div class="progress-bar-track">
+          <div id="progressBarFill" class="progress-bar-fill"></div>
+        </div>
+      </div>
+
+      <audio id="player" controls hidden></audio>
+      <div id="downloadRow" class="row" hidden>
+        <a id="downloadLink" class="btn btn-ghost" href="#" download>下载 MP3</a>
+        <span id="audioMeta" class="meta"></span>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>历史记录</h2>
+      <ol id="history" class="history">
+        <li class="hint-inline">最近生成的音频会列在这里（仅本会话，浏览器关闭前有效）。</li>
+      </ol>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>txt2tts v0.1 · TTS: <code id="ttsInfo">MiniMax Speech 2.8</code></span>
+    <span><a href="/api/health" target="_blank">/api/health</a> · <a href="/docs" target="_blank">API 文档</a></span>
+  </footer>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
