@@ -1,7 +1,12 @@
-"""Unit tests for LlmNormalizer. M3 HTTP is mocked via respx."""
+"""Unit tests for LlmNormalizer.
+
+M3 calls are mocked via `unittest.mock.patch` against `LlmNormalizer._get_client`,
+which returns a fake ChatAnthropic client with a programmable `ainvoke`.
+"""
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-import respx
-from httpx import Response
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.config import LlmSettings, M3_SYSTEM_PROMPT
 from app.services.llm_normalizer import LlmNormalizationError, LlmNormalizer
@@ -10,152 +15,127 @@ from app.services.llm_normalizer import LlmNormalizationError, LlmNormalizer
 pytestmark = pytest.mark.asyncio
 
 
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
 def _settings(api_key: str = "test-key") -> LlmSettings:
-    return LlmSettings(api_key=api_key, base_url="https://api.example.com/anthropic",
-                       messages_path="/v1/messages", model="MiniMax-M3",
-                       max_retries=0, request_timeout_sec=5.0)
-
-
-def _anthropic_ok(text: str) -> dict:
-    return {"content": [{"type": "text", "text": text}], "stop_reason": "end_turn"}
-
-
-@respx.mock
-async def test_normalize_happy_path():
-    s = _settings()
-    n = LlmNormalizer(s)
-    respx.post("https://api.example.com/anthropic/v1/messages").mock(
-        return_value=Response(200, json=_anthropic_ok("标准化的中文文本。"))
+    return LlmSettings(
+        api_key=api_key,
+        base_url="https://api.example.com/anthropic",
+        model="MiniMax-M3",
+        max_retries=0,
+        request_timeout_sec=5.0,
     )
-    try:
+
+
+class _FakeResp:
+    """Mimics the minimal shape of `langchain_core.messages.AIMessage`."""
+
+    def __init__(self, content: str):
+        self.content = content
+
+
+def _patch_client(content: str | None = "标准化的中文文本。", side_effect: BaseException | None = None):
+    """Patch `LlmNormalizer._get_client` to return a programmable fake client.
+
+    Usage:
+        with _patch_client(content="hi"):
+            ... await n.normalize("x")
+        with _patch_client(side_effect=RuntimeError("boom")):
+            ... await n.normalize("x")
+    """
+    client = MagicMock()
+    if side_effect is not None:
+        client.ainvoke = AsyncMock(side_effect=side_effect)
+    else:
+        client.ainvoke = AsyncMock(return_value=_FakeResp(content or ""))
+    return patch.object(LlmNormalizer, "_get_client", return_value=client)
+
+
+# ---------------------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------------------
+
+
+async def test_normalize_happy_path():
+    n = LlmNormalizer(_settings())
+    with _patch_client(content="标准化的中文文本。"):
         out = await n.normalize("原始文本")
-    finally:
-        await n.aclose()
     assert out == "标准化的中文文本。"
 
 
-@respx.mock
 async def test_normalize_strips_code_fences():
-    s = _settings()
-    n = LlmNormalizer(s)
-    respx.post("https://api.example.com/anthropic/v1/messages").mock(
-        return_value=Response(200, json=_anthropic_ok("```\n干净的输出\n```"))
-    )
-    try:
+    n = LlmNormalizer(_settings())
+    with _patch_client(content="```\n干净的输出\n```"):
         out = await n.normalize("x")
-    finally:
-        await n.aclose()
     assert out == "干净的输出"
 
 
-@respx.mock
 async def test_normalize_strips_code_fence_with_lang_tag():
-    s = _settings()
-    n = LlmNormalizer(s)
-    respx.post("https://api.example.com/anthropic/v1/messages").mock(
-        return_value=Response(200, json=_anthropic_ok("```markdown\n文本 A\n文本 B\n```"))
-    )
-    try:
+    n = LlmNormalizer(_settings())
+    with _patch_client(content="```markdown\n文本 A\n文本 B\n```"):
         out = await n.normalize("x")
-    finally:
-        await n.aclose()
     assert out == "文本 A\n文本 B"
 
 
-@respx.mock
 async def test_normalize_strips_outer_quotes():
-    s = _settings()
-    n = LlmNormalizer(s)
-    respx.post("https://api.example.com/anthropic/v1/messages").mock(
-        return_value=Response(200, json=_anthropic_ok('"被引号包住的文本"'))
-    )
-    try:
+    n = LlmNormalizer(_settings())
+    with _patch_client(content='"被引号包住的文本"'):
         out = await n.normalize("x")
-    finally:
-        await n.aclose()
     assert out == "被引号包住的文本"
 
 
-@respx.mock
 async def test_normalize_sends_system_prompt():
-    """The request body must include the M3 system prompt and the input text."""
-    s = _settings()
-    n = LlmNormalizer(s)
-    route = respx.post("https://api.example.com/anthropic/v1/messages").mock(
-        return_value=Response(200, json=_anthropic_ok("ok"))
-    )
-    try:
+    """The ChatAnthropic call must include the M3 system prompt + user text."""
+    n = LlmNormalizer(_settings())
+    client = MagicMock()
+    client.ainvoke = AsyncMock(return_value=_FakeResp("ok"))
+    with patch.object(LlmNormalizer, "_get_client", return_value=client):
         await n.normalize("hello world")
-    finally:
-        await n.aclose()
-    assert route.called
-    body = route.calls.last.request.content
-    import json as _json
-    parsed = _json.loads(body)
-    assert parsed["model"] == "MiniMax-M3"
-    assert parsed["system"] == M3_SYSTEM_PROMPT
-    assert parsed["messages"] == [{"role": "user", "content": "hello world"}]
+
+    client.ainvoke.assert_awaited_once()
+    messages = client.ainvoke.await_args.args[0]
+    assert isinstance(messages[0], SystemMessage)
+    assert messages[0].content == M3_SYSTEM_PROMPT
+    assert isinstance(messages[1], HumanMessage)
+    assert messages[1].content == "hello world"
 
 
-@respx.mock
 async def test_normalize_raises_on_5xx():
-    s = _settings()
-    n = LlmNormalizer(s)
-    respx.post("https://api.example.com/anthropic/v1/messages").mock(
-        return_value=Response(503, text="upstream busy")
-    )
-    try:
+    """SDK/network errors are wrapped as LlmNormalizationError."""
+    n = LlmNormalizer(_settings())
+    with _patch_client(side_effect=RuntimeError("upstream busy")):
         with pytest.raises(LlmNormalizationError):
             await n.normalize("x")
-    finally:
-        await n.aclose()
 
 
-@respx.mock
 async def test_normalize_raises_on_4xx_no_retry():
-    s = _settings()
-    n = LlmNormalizer(s)
-    respx.post("https://api.example.com/anthropic/v1/messages").mock(
-        return_value=Response(401, text="bad key")
-    )
-    try:
+    n = LlmNormalizer(_settings())
+    with _patch_client(side_effect=RuntimeError("401 unauthorized")):
         with pytest.raises(LlmNormalizationError) as exc:
             await n.normalize("x")
-        assert "401" in str(exc.value)
-    finally:
-        await n.aclose()
+        # Original SDK error text should be present.
+        assert "401" in str(exc.value) or "unauthorized" in str(exc.value)
 
 
-@respx.mock
 async def test_normalize_raises_on_empty_response():
-    s = _settings()
-    n = LlmNormalizer(s)
-    respx.post("https://api.example.com/anthropic/v1/messages").mock(
-        return_value=Response(200, json={"content": []})
-    )
-    try:
+    n = LlmNormalizer(_settings())
+    # SDK returned a message object but `.content` is empty.
+    with _patch_client(content=""):
         with pytest.raises(LlmNormalizationError):
             await n.normalize("x")
-    finally:
-        await n.aclose()
 
 
 async def test_normalize_requires_api_key():
-    s = LlmSettings(api_key="", base_url="https://x", messages_path="/v1/messages")
-    n = LlmNormalizer(s)
-    try:
-        with pytest.raises(LlmNormalizationError) as exc:
-            await n.normalize("x")
-        assert "API key" in str(exc.value)
-    finally:
-        await n.aclose()
+    n = LlmNormalizer(_settings(api_key=""))
+    with pytest.raises(LlmNormalizationError) as exc:
+        await n.normalize("x")
+    assert "API key" in str(exc.value)
 
 
 async def test_normalize_rejects_empty_input():
-    s = _settings()
-    n = LlmNormalizer(s)
-    try:
-        with pytest.raises(LlmNormalizationError):
-            await n.normalize("   \n\n  ")
-    finally:
-        await n.aclose()
+    n = LlmNormalizer(_settings())
+    with pytest.raises(LlmNormalizationError):
+        await n.normalize("   \n\n  ")

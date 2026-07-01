@@ -1,5 +1,4 @@
-"""MiniMax M3 chat-completions client used to normalize Markdown-derived text
-into a TTS-friendly form.
+"""MiniMax M3 normalization via LangChain ChatAnthropic.
 
 Pipeline position:
     MarkdownService.to_plain_text()  ->  LlmNormalizer.normalize()  ->  TtsClient.synthesize()
@@ -9,15 +8,19 @@ The normalizer is intentionally strict: if the M3 call fails for any reason
 LlmNormalizationError. Per product decision, **no local fallback is applied**:
 the route returns 502 to the client so the user is aware that the M3 step
 did not complete successfully.
+
+HTTP-level concerns (auth headers, request body serialization, retry, response
+parsing) are delegated to LangChain's `ChatAnthropic` SDK; we only orchestrate
+the system / user message framing and our own outer retry loop.
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Any, Optional
 
-import httpx
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.config import LlmSettings, M3_SYSTEM_PROMPT
 
@@ -28,44 +31,16 @@ class LlmNormalizationError(RuntimeError):
     """Raised when the M3 normalization step fails."""
 
 
-def _get_in(obj: Any, dotted: str) -> Optional[Any]:
-    """Resolve a dotted response path like 'content.0.text' against a dict/list."""
-    cur: Any = obj
-    for part in dotted.split("."):
-        if cur is None:
-            return None
-        if part.isdigit():
-            idx = int(part)
-            if isinstance(cur, list) and 0 <= idx < len(cur):
-                cur = cur[idx]
-            else:
-                return None
-        else:
-            if isinstance(cur, dict) and part in cur:
-                cur = cur[part]
-            else:
-                return None
-    return cur
-
-
 _FENCE_LINE_RE = re.compile(r"^\s*```", re.MULTILINE)
 _OUTER_QUOTE_RE = re.compile(r'^[\s"\'`]+|[\s"\'`]+$')
 
 
 class LlmNormalizer:
-    """Async wrapper for a single M3 chat-completions call."""
+    """Async wrapper for a single M3 ChatAnthropic call."""
 
     def __init__(self, settings: LlmSettings) -> None:
         self._settings = settings
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(settings.request_timeout_sec),
-            headers={
-                "x-api-key": settings.api_key,
-                "anthropic-version": settings.api_version,
-                "content-type": "application/json",
-                "accept": "application/json",
-            },
-        )
+        self._client: Optional[ChatAnthropic] = None  # lazy
 
     # -- public API ----------------------------------------------------------
 
@@ -82,58 +57,52 @@ class LlmNormalizer:
                 "MiniMax M3 API key is not configured. Set LLM__API_KEY env var."
             )
 
-        body = self._settings.build_request_body(
-            system=system or M3_SYSTEM_PROMPT,
-            user_text=text,
-        )
+        client = self._get_client()
+        messages = [
+            SystemMessage(content=system or M3_SYSTEM_PROMPT),
+            HumanMessage(content=text),
+        ]
         logger.debug(
-            "M3 normalize request: url=%s model=%s text_len=%d",
-            self._settings.messages_url, self._settings.model, len(text),
+            "M3 normalize via ChatAnthropic: model=%s base=%s text_len=%d",
+            self._settings.model, self._settings.base_url, len(text),
         )
 
-        last_err: Optional[Exception] = None
+        last_err: Optional[BaseException] = None
         for attempt in range(self._settings.max_retries + 1):
             try:
-                resp = await self._client.post(
-                    self._settings.messages_url, json=body
-                )
-            except httpx.HTTPError as exc:
+                resp = await client.ainvoke(messages)
+            except Exception as exc:  # 网络 / 5xx / SDK 错误
                 last_err = exc
-                logger.warning("M3 HTTP error on attempt %d: %s", attempt + 1, exc)
+                logger.warning("M3 error on attempt %d: %s", attempt + 1, exc)
                 continue
 
-            if resp.status_code >= 500:
-                last_err = LlmNormalizationError(
-                    f"M3 5xx: {resp.status_code} {resp.text[:200]}"
-                )
-                logger.warning("M3 5xx on attempt %d: %s", attempt + 1, last_err)
-                continue
-
-            if resp.status_code >= 400:
-                raise LlmNormalizationError(
-                    f"M3 API error {resp.status_code}: {resp.text[:500]}"
-                )
-
-            try:
-                payload = resp.json()
-            except json.JSONDecodeError as exc:
-                raise LlmNormalizationError(f"M3 returned non-JSON body: {exc}")
-
-            content = _get_in(payload, self._settings.response_text_path)
+            content = getattr(resp, "content", None)
             if not isinstance(content, str) or not content.strip():
                 raise LlmNormalizationError(
-                    f"M3 response missing text at '{self._settings.response_text_path}': "
-                    f"{json.dumps(payload)[:300]}"
+                    f"M3 response missing text content: {repr(resp)[:300]}"
                 )
-
             return self._post_process(content)
 
         raise LlmNormalizationError(f"M3 failed after retries: {last_err}")
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        """Release resources. ChatAnthropic owns no explicit client; no-op."""
+        return None
 
     # -- internals -----------------------------------------------------------
+
+    def _get_client(self) -> ChatAnthropic:
+        if self._client is None:
+            self._client = ChatAnthropic(
+                model=self._settings.model,
+                api_key=self._settings.api_key,
+                base_url=self._settings.base_url,
+                max_tokens=self._settings.max_tokens,
+                temperature=self._settings.temperature,
+                timeout=self._settings.request_timeout_sec,
+                max_retries=0,  # 外层 LlmNormalizer 独占重试，避免双层重试
+            )
+        return self._client
 
     @staticmethod
     def _post_process(content: str) -> str:
@@ -149,8 +118,6 @@ class LlmNormalizer:
             if first != last:
                 # Drop the first (which may carry a language tag) and the last fence.
                 inner_lines = lines[first + 1:last]
-                # If the first fence line was something like ```markdown, we already
-                # removed it; nothing more to do.
                 lines = inner_lines
         s = "\n".join(lines).strip()
 

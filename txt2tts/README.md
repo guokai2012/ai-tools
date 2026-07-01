@@ -85,19 +85,17 @@ UI 会自动列出全部 9 个选项。
 | `APP__MAX_MD_SIZE_KB` | `1024` | 上传 md 大小上限 |
 | `APP__MAX_NORMALIZED_CHARS` | `50000` | M3 标准化后文本长度上限 |
 
-### MiniMax M3（`LLM__*`，Anthropic Messages API）
+### MiniMax M3（`LLM__*`，通过 LangChain `ChatAnthropic` 调用 Anthropic Messages API）
 
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
-| `LLM__API_KEY` | _(空)_ | M3 API Key（用作 `x-api-key`） |
-| `LLM__BASE_URL` | `https://api.minimaxi.com/anthropic` | M3 endpoint base |
-| `LLM__MESSAGES_PATH` | `/v1/messages` | 路径 |
+| `LLM__API_KEY` | _(空)_ | M3 API Key（由 LangChain SDK 作为鉴权凭据发送） |
+| `LLM__BASE_URL` | `https://api.minimaxi.com/anthropic` | M3 endpoint base（Anthropic 兼容形态） |
 | `LLM__MODEL` | `MiniMax-M3` | 模型 id |
-| `LLM__API_VERSION` | `2023-06-01` | Anthropic 版本头 |
 | `LLM__MAX_TOKENS` | `8192` | M3 单次最大输出 token |
 | `LLM__TEMPERATURE` | `0.2` | 温度 |
-| `LLM__REQUEST_TIMEOUT_SEC` | `60.0` | 超时 |
-| `LLM__MAX_RETRIES` | `2` | 5xx 重试次数 |
+| `LLM__REQUEST_TIMEOUT_SEC` | `60.0` | SDK 调用超时 |
+| `LLM__MAX_RETRIES` | `2` | 外层重试次数（SDK 内置重试固定为 0） |
 
 ### 小米 MiMo TTS（`TTS__*`，chat/completions 多模态）
 
@@ -188,7 +186,7 @@ txt2tts\
 │   ├── routers\tts.py        # REST 路由
 │   ├── services\
 │   │   ├── markdown_service.py  # md → 纯文本
-│   │   ├── llm_normalizer.py    # MiniMax M3 (Anthropic Messages)
+│   │   ├── llm_normalizer.py    # MiniMax M3（通过 LangChain ChatAnthropic）
 │   │   ├── tts_client.py        # 小米 MiMo (chat/completions multimodal)
 │   │   └── audio_storage.py     # MP3 落盘
 │   ├── models\schemas.py     # Pydantic DTO
@@ -197,7 +195,7 @@ txt2tts\
 ├── outputs\                  # 生成的 MP3
 ├── tests\
 │   ├── test_markdown.py      # 4 个本地清洗测试
-│   ├── test_llm_normalizer.py# 10 个 M3 测试（respx mock）
+│   ├── test_llm_normalizer.py# M3 测试（unittest.mock patch ChatAnthropic）
 │   └── test_tts_client.py    # 9 个 MiMo TTS 测试（respx mock）
 ├── run_e2e_xiaomi.py         # 真实 API 端到端脚本
 ├── requirements.txt
@@ -211,7 +209,7 @@ txt2tts\
 D:\anaconda3\python.exe -m pytest tests/ -v
 ```
 
-预期：**23 passed**（4 markdown + 10 llm_normalizer + 9 tts_client）。
+预期：**~23 passed**（4 markdown + 10 llm_normalizer + 9 tts_client + pipeline）。
 
 ## 真实端到端验证
 
@@ -236,11 +234,12 @@ D:\anaconda3\python.exe run_e2e_xiaomi.py
 
 由于训练数据无法联网验证最新文档，代码默认按以下假设构造请求（已经过真实 API 验证）：
 
-- **MiniMax M3**（Anthropic Messages API）
-  - `POST {LLM__BASE_URL}/v1/messages`
-  - Header: `x-api-key: <LLM__API_KEY>` + `anthropic-version: 2023-06-01`
-  - 响应取 `content[0].text`
-- **小米 MiMo TTS**（chat/completions 多模态）
+- **MiniMax M3**（Anthropic Messages API，**通过 LangChain `ChatAnthropic`**）
+  - `client = ChatAnthropic(model=..., api_key=..., base_url=LLM__BASE_URL, max_tokens=..., temperature=..., timeout=..., max_retries=0)`
+  - `await client.ainvoke([SystemMessage(content=M3_SYSTEM_PROMPT), HumanMessage(content=text)])`
+  - SDK 内部按 Anthropic Messages 协议拼装 `POST {base_url}/v1/messages`，鉴权头与 `anthropic-version` 由 SDK 注入
+  - 响应取 `resp.content`（已解析的文本）
+- **小米 MiMo TTS**（chat/completions 多模态，仍走原始 HTTP）
   - `POST {TTS__BASE_URL}/v1/chat/completions`
   - Header: `Authorization: Bearer <TTS__API_KEY>`
   - Body 必须包含 `modalities=["text","audio"]`、`audio.format="mp3"`、`messages[1].role="assistant"`

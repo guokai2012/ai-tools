@@ -1,7 +1,8 @@
-"""Real end-to-end: M3 normalization + Xiaomi MiMo TTS + save mp3 + validate."""
+"""Real end-to-end: M3 normalization (via LangChain ChatAnthropic) + Xiaomi MiMo TTS + save mp3 + validate."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import sys
 import time
@@ -12,7 +13,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-import httpx  # noqa: E402
+import httpx  # noqa: E402  (MiMo TTS 仍走 HTTP，未被 LangChain 接管)
+
+from langchain_anthropic import ChatAnthropic  # noqa: E402
+from langchain_core.messages import HumanMessage, SystemMessage  # noqa: E402
 
 from app.config import M3_SYSTEM_PROMPT, get_settings  # noqa: E402
 from app.services.markdown_service import MarkdownService  # noqa: E402
@@ -62,35 +66,36 @@ async def main() -> int:
     print(f"md_chars      = {len(md_text)}")
     print(f"local_clean   = {len(local_clean)} chars", flush=True)
 
-    # ---- 2. Real M3 call ----
-    step("STEP 2 — real MiniMax M3 normalize")
+    # ---- 2. Real M3 call (via LangChain ChatAnthropic) ----
+    step("STEP 2 — real MiniMax M3 normalize (via LangChain ChatAnthropic)")
     llm = settings.llm
-    body = {
-        "model": llm.model,
-        "max_tokens": llm.max_tokens,
-        "temperature": llm.temperature,
-        "system": M3_SYSTEM_PROMPT,
-        "messages": [{"role": "user", "content": local_clean}],
-    }
-    headers = {
-        "x-api-key": llm_key,
-        "anthropic-version": llm.api_version,
-        "content-type": "application/json",
-    }
-    print(f"POST {llm.messages_url}  model={llm.model}", flush=True)
+    client = ChatAnthropic(
+        model=llm.model,
+        api_key=llm_key,
+        base_url=llm.base_url,
+        max_tokens=llm.max_tokens,
+        temperature=llm.temperature,
+        timeout=llm.request_timeout_sec,
+        max_retries=0,
+    )
+    messages = [
+        SystemMessage(content=M3_SYSTEM_PROMPT),
+        HumanMessage(content=local_clean),
+    ]
+    print(f"POST {llm.base_url}  model={llm.model}  (via ChatAnthropic)", flush=True)
     t0 = time.time()
-    async with httpx.AsyncClient(timeout=httpx.Timeout(llm.request_timeout_sec)) as c:
-        r = await c.post(llm.messages_url, json=body, headers=headers)
-    print(f"-> {r.status_code}  ({(time.time()-t0)*1000:.0f}ms)")
-    if r.status_code != 200:
-        print(f"BODY: {r.text[:500]}")
+    try:
+        resp = await client.ainvoke(messages)
+    except Exception as exc:
+        print(f"ERROR: M3 call failed: {exc}", file=sys.stderr)
         return 1
-    payload = r.json()
-    normalized = payload["content"][0]["text"]
-    print(f"M3 returned   = {len(normalized)} chars  usage={payload.get('usage')}")
+    print(f"-> 200  ({(time.time()-t0)*1000:.0f}ms)")
+    normalized = resp.content
+    usage = getattr(resp, "usage_metadata", None) or getattr(resp, "response_metadata", {})
+    print(f"M3 returned   = {len(normalized)} chars  usage={usage}")
     print(f"preview       = {normalized[:160]!r}...", flush=True)
 
-    # ---- 3. Real Xiaomi MiMo TTS call ----
+    # ---- 3. Real Xiaomi MiMo TTS call (still HTTP) ----
     step("STEP 3 — real Xiaomi MiMo TTS synthesize")
     tts = settings.tts
     body = tts.build_request_body(text=normalized)
@@ -107,14 +112,12 @@ async def main() -> int:
     if r.status_code != 200:
         print(f"BODY: {r.text[:500]}")
         return 1
-    import json as _json
     payload = r.json()
     audio = payload["choices"][0]["message"]["audio"]
     print(f"audio.id      = {audio.get('id')}")
     print(f"b64_len       = {len(audio['data'])} chars", flush=True)
 
     # ---- 4. Decode base64 -> raw mp3 bytes ----
-    import base64
     raw = base64.b64decode(audio["data"])
     print(f"decoded_bytes = {len(raw)}")
     print(f"head_hex      = {raw[:16].hex()}", flush=True)

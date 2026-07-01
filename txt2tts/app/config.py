@@ -14,35 +14,22 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class LlmSettings(BaseSettings):
-    """MiniMax M3 chat-completions settings (Anthropic Messages API shape)."""
+    """MiniMax M3 settings via LangChain ChatAnthropic (Anthropic Messages API).
 
-    api_key: str = Field(default="", description="MiniMax M3 API key (x-api-key header)")
+    Internally we delegate HTTP / auth / retry to the LangChain SDK; this class
+    only carries the knobs the application cares about.
+    """
+
+    api_key: str = Field(default="", description="MiniMax M3 API key")
     base_url: str = Field(default="https://api.minimaxi.com/anthropic")
-    messages_path: str = Field(default="/v1/messages")
     model: str = Field(default="MiniMax-M3")
-    api_version: str = Field(default="2023-06-01")
     max_tokens: int = Field(default=8192)
     temperature: float = Field(default=0.2)
-
-    response_text_path: str = Field(default="content.0.text")
 
     request_timeout_sec: float = Field(default=60.0)
     max_retries: int = Field(default=2)
 
     model_config = SettingsConfigDict(env_prefix="LLM__", case_sensitive=False)
-
-    @property
-    def messages_url(self) -> str:
-        return f"{self.base_url.rstrip('/')}{self.messages_path}"
-
-    def build_request_body(self, system: str, user_text: str) -> dict:
-        return {
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "system": system,
-            "messages": [{"role": "user", "content": user_text}],
-        }
 
 
 class TtsSettings(BaseSettings):
