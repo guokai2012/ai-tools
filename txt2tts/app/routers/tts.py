@@ -21,11 +21,14 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.config import AppSettings, StaticVoices, get_settings
 from app.models.schemas import (
+    AudioDetailDto,
+    AudioRecordDto,
+    LibraryPageDto,
     SynthesizeResponse,
     VoiceDto,
     VoicesResponse,
 )
-from app.services.audio_storage import AudioStorageService
+from app.services.audio_storage import AudioStorageService, LibraryStore
 from app.services.llm_normalizer import LlmNormalizationError, LlmNormalizer
 from app.services.markdown_service import MarkdownService
 from app.services.pipeline import TtsPipeline
@@ -41,6 +44,7 @@ _markdown_svc: Optional[MarkdownService] = None
 _llm_normalizer: Optional[LlmNormalizer] = None
 _tts_client: Optional[TtsClient] = None
 _audio_storage: Optional[AudioStorageService] = None
+_library: Optional[LibraryStore] = None
 _pipeline: Optional[TtsPipeline] = None
 
 
@@ -50,14 +54,16 @@ def configure(
     llm: LlmNormalizer,
     tts: TtsClient,
     audio: AudioStorageService,
+    library: LibraryStore,
 ) -> None:
     """Inject the shared service instances. Called once from main.py."""
-    global _markdown_svc, _llm_normalizer, _tts_client, _audio_storage, _pipeline
+    global _markdown_svc, _llm_normalizer, _tts_client, _audio_storage, _library, _pipeline
     _markdown_svc = markdown
     _llm_normalizer = llm
     _tts_client = tts
     _audio_storage = audio
-    _pipeline = TtsPipeline(markdown=markdown, llm=llm, tts=tts, audio=audio)
+    _library = library
+    _pipeline = TtsPipeline(markdown=markdown, llm=llm, tts=tts, audio=audio, library=library)
 
 
 def _require_md() -> MarkdownService:
@@ -82,6 +88,12 @@ def _require_audio() -> AudioStorageService:
     if _audio_storage is None:
         raise HTTPException(status_code=503, detail="AudioStorageService not initialized")
     return _audio_storage
+
+
+def _require_library() -> LibraryStore:
+    if _library is None:
+        raise HTTPException(status_code=503, detail="LibraryStore not initialized")
+    return _library
 
 
 # ---- routes ----------------------------------------------------------------
@@ -224,6 +236,57 @@ async def get_audio(audio_id: str) -> FileResponse:
 @router.get("/storage/stats")
 async def storage_stats() -> dict:
     return _require_audio().stats()
+
+
+# ---- Library (听文档) ---------------------------------------------------
+
+
+@router.get("/library", response_model=LibraryPageDto)
+async def list_library(
+    page: int = 1,
+    size: int = 10,
+) -> LibraryPageDto:
+    """Paginated list of successfully synthesized audios, newest first."""
+    library = _require_library()
+    page = max(1, page)
+    size = max(1, min(size, 100))  # cap page size
+    items, total = library.list_page(page=page, size=size)
+    return LibraryPageDto(
+        items=[
+            AudioRecordDto(
+                audio_id=r.audio_id,
+                original_filename=r.original_filename,
+                voice_id=r.voice_id,
+                duration_sec=r.duration_sec,
+                byte_size=r.byte_size,
+                created_at=r.created_at,
+            )
+            for r in items
+        ],
+        page=page,
+        size=size,
+        total=total,
+    )
+
+
+@router.get("/library/{audio_id}", response_model=AudioDetailDto)
+async def get_library_item(audio_id: str) -> AudioDetailDto:
+    """Detail view: includes the original + normalized Markdown for the player."""
+    library = _require_library()
+    record = library.get(audio_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Library entry not found.")
+    return AudioDetailDto(
+        audio_id=record.audio_id,
+        original_filename=record.original_filename,
+        original_md=record.original_md,
+        normalized_md=record.normalized_md,
+        voice_id=record.voice_id,
+        duration_sec=record.duration_sec,
+        byte_size=record.byte_size,
+        created_at=record.created_at,
+        audio_url=f"/api/audio/{record.audio_id}",
+    )
 
 
 # Local import to avoid polluting top-level namespace.

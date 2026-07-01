@@ -31,3 +31,38 @@ class SynthesizeResponse(BaseModel):
 class ErrorResponse(BaseModel):
     error: str
     detail: Optional[str] = None
+
+
+# ---- Library (听文档) --------------------------------------------------
+
+
+class AudioRecordDto(BaseModel):
+    """List-view entry: metadata only, no MD content."""
+
+    audio_id: str
+    original_filename: str
+    voice_id: Optional[str] = None
+    duration_sec: Optional[float] = None
+    byte_size: int
+    created_at: str
+
+
+class LibraryPageDto(BaseModel):
+    items: List[AudioRecordDto]
+    page: int
+    size: int
+    total: int
+
+
+class AudioDetailDto(BaseModel):
+    """Detail-view entry: includes original + normalized MD content."""
+
+    audio_id: str
+    original_filename: str
+    original_md: str
+    normalized_md: str
+    voice_id: Optional[str] = None
+    duration_sec: Optional[float] = None
+    byte_size: int
+    created_at: str
+    audio_url: str

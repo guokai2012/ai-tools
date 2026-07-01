@@ -116,6 +116,7 @@ class AppSettings(BaseSettings):
     reload: bool = True
 
     output_dir: Path = Field(default=Path("./outputs"))
+    library_db_filename: str = Field(default="library.db", description="SQLite file name under output_dir")
     static_dir: Path = Field(default="./app/static", description="Static UI dir")
 
     tts: TtsSettings = Field(default_factory=TtsSettings)

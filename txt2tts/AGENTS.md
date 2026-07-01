@@ -4,6 +4,8 @@
 一个轻量的 FastAPI 应用，把上传的 `.md`（也支持 `.markdown` / `.txt`）文件转成 MP3：
 `.md` → 本地 Markdown 清洗 → **MiniMax M3** 大模型标准化 → **小米 MiMo `mimo-v2.5-tts`** 语音合成 → 存到 `outputs/<YYYY-MM-DD>/<uuid>.mp3` → 通过 `/api/audio/{id}` 流式播放。
 
+并配套一个**「听文档」**二级菜单（**默认进入**），把每次成功的合成记录写入 SQLite 索引 `outputs/library.db`，支持分页浏览、播放详情页展示原文，并按"等分时间表"高亮当前段。
+
 `README.md` 是唯一的权威规格说明 —— 在修改流水线行为、环境变量或 API 字段之前，请先阅读它。
 
 ## 目录结构
@@ -16,8 +18,8 @@ app/
     markdown_service.py # md → 纯文本（基于 markdown-it-py）
     llm_normalizer.py   # MiniMax M3（通过 LangChain ChatAnthropic 调用 Anthropic Messages API）
     tts_client.py       # 小米 MiMo（chat/completions 多模态音频，仍走原始 HTTP）
-    audio_storage.py    # MP3 落盘
-    pipeline.py         # 编排辅助（preview / synthesize）
+    audio_storage.py    # MP3 落盘 + LibraryStore（SQLite 听文档索引）
+    pipeline.py         # 编排辅助（preview / synthesize，写库）
   models/schemas.py    # Pydantic 数据传输对象
   static/              # 前端（index.html 等）
 tests/                 # pytest + respx mock（见 pytest.ini：asyncio_mode=auto）
@@ -45,8 +47,10 @@ run_e2e_xiaomi.py      # 真实 API 端到端脚本（需要两个 API Key）
 - **服务是无状态的 async 类**，在 `main.py` 的 lifespan 中构造；路由通过 `routers.tts.configure(...)` 接收它们。**不要**在 service 内部导入 settings，要从外部把 `*Settings` 对象传进去。
 - **`TtsSettings` 负责 MiMo TTS 请求体构造**（`build_request_body(...)`），修改 payload 字段时请集中在 `config.py` 调整。`LlmSettings` 仅保留 LangChain `ChatAnthropic` 客户端构造所需的字段（`api_key` / `base_url` / `model` / `max_tokens` / `temperature` / `request_timeout_sec` / `max_retries`）；HTTP 头 / 请求路径 / 协议版本由 SDK 内部处理。
 - **`M3_SYSTEM_PROMPT` 定义在 `config.py`**（而非 normalizer 服务里），修改提示词请直接改这里。
-- **路由的 HTTP 状态码约定**：M3/TTS 调用失败必须返回 **502**，空 `.md` 返回 **422**，超大 `.md` 返回 **413`。修改 `routers/tts.py` 时请保持这一契约。
+- **路由的 HTTP 状态码约定**：M3/TTS 调用失败必须返回 **502**，空 `.md` 返回 **422**，超大 `.md` 返回 **413`，`GET /api/library/{id}` 找不到返回 **404**。修改 `routers/tts.py` 时请保持这一契约。
 - **MP3 落盘路径**由 `output_dir` + 日期 + uuid 组成。如要调整磁盘布局，请同时更新 `GET /api/audio/{audio_id}` 的查找逻辑。
+- **听文档（LibraryStore）**：`outputs/library.db`（路径由 `AppSettings.library_db_filename` 控制）存储合成记录。写入只发生在 `pipeline.run` 成功之后，**失败不影响主流程**（被 try/except 吞掉并 log）。`LibraryStore` 用 Python 标准库 `sqlite3`，不引入新依赖；连接使用 `check_same_thread=False` 容忍 FastAPI 跨线程复用。
+- **前端 hash 路由**：`#/`（听文档，默认）、`#/upload`（上传转语音）、`#/play/<audio_id>`（播放详情）。菜单切换无刷新；播放详情按 `normalized_md` 的**空行**拆段，**等分时间表**（`duration ÷ 段数`）控制高亮，**不依赖** TTS 端时间戳。
 - **禁止在代码中硬编码密钥**：`.env` 已被 gitignore，绝不能提交真实的 `LLM__API_KEY` / `TTS__API_KEY`。
 
 ## 代码风格
@@ -66,6 +70,9 @@ run_e2e_xiaomi.py      # 真实 API 端到端脚本（需要两个 API Key）
 
 ## 修改前必读
 - `README.md` —— 完整流水线、环境变量、API 契约以及真实 API 验证日志。
-- `app/config.py` —— 提示词、环境变量前缀、`TtsSettings` 请求体的唯一权威来源。
-- `app/main.py` —— 装配顺序（dotenv → settings → services → router configure → lifespan）。
+- `app/config.py` —— 提示词、环境变量前缀、`TtsSettings` 请求体的唯一权威来源；`AppSettings.library_db_filename` 控制听文档库文件位置。
+- `app/main.py` —— 装配顺序（dotenv → settings → services → router configure → lifespan）；新服务（如 `LibraryStore`）需在 lifespan 中实例化并通过 `tts_router.configure(...)` 注入。
+- `app/services/audio_storage.py` —— 同时承载 `AudioStorageService`（MP3 落盘）与 `LibraryStore`（SQLite 索引）；改一处时留意对另一处的影响。
+- `app/services/pipeline.py` —— `audio_save` 成功后调用 `library.insert(...)`，写入失败被 try/except 吞掉；如果想让索引写入变成硬错误，需同步修改此处与 `main.py` 装配链。
 - `run_e2e_xiaomi.py` —— 当 mock 测试与真实接口出现偏差时，对照此文件确认 M3（LangChain）+ MiMo（HTTP）真实请求形态。
+- `app/static/{index.html,app.js,styles.css}` —— 前端 SPA 在 `app/static/app.js` 中通过 hash 路由切视图；菜单与列表/高亮样式分别对应 `.menu`、`.library-list`、`.play-content .segment.playing`。

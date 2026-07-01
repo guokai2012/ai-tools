@@ -23,6 +23,8 @@ dist/
 # Project: generated audio
 outputs/
 !outputs/.gitkeep
+# Library metadata DB (听文档 feature) — local runtime state
+outputs/library.db
 
 # Env / secrets
 .env

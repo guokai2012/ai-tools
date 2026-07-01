@@ -1,4 +1,5 @@
 // Minimal vanilla-JS client for the txt2tts backend.
+// Single-page app with hash-based routing: #/ (listen, default), #/upload, #/play/<id>.
 
 const $ = (id) => document.getElementById(id);
 
@@ -9,6 +10,12 @@ const state = {
   currentText: "",
   audioUrl: null,
   history: [],
+  // Library (听文档) pagination
+  libPage: 1,
+  libSize: 10,
+  libTotal: 0,
+  // Cached play detail (so the player view can re-render segments without re-fetching)
+  playDetail: null,
 };
 
 // ---- API helpers ---------------------------------------------------------
@@ -22,6 +29,210 @@ async function api(path, opts = {}) {
     throw new Error(`${r.status} ${msg}`);
   }
   return body;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+// ---- Hash router ---------------------------------------------------------
+
+function currentPath() {
+  const h = location.hash.replace(/^#/, "");
+  return h === "" ? "/" : h;
+}
+
+function showView(name) {
+  document.querySelectorAll(".view").forEach((v) => { v.hidden = true; });
+  const el = $(`view-${name}`);
+  if (el) el.hidden = false;
+}
+
+function highlightMenu(path) {
+  document.querySelectorAll(".menu-item").forEach((a) => {
+    const r = a.dataset.route;
+    const active = r === "/" ? path === "/" : path.startsWith(r);
+    a.classList.toggle("active", active);
+  });
+}
+
+function router() {
+  const path = currentPath();
+  highlightMenu(path);
+
+  if (path === "/") {
+    showView("listen");
+    renderListen();
+  } else if (path === "/upload") {
+    showView("upload");
+    // The upload view's bindings are set up once on boot; nothing per-route.
+  } else if (path.startsWith("/play/")) {
+    const id = path.slice("/play/".length).split("/")[0];
+    if (id) {
+      showView("play");
+      renderPlay(id);
+    } else {
+      location.hash = "#/";
+    }
+  } else {
+    // Unknown route → fall back to listen.
+    location.hash = "#/";
+  }
+}
+
+// ---- View: 听文档 (default) ----------------------------------------------
+
+async function renderListen() {
+  const list = $("libraryList");
+  list.innerHTML = '<p class="hint-inline">加载中…</p>';
+
+  try {
+    const data = await api(`/api/library?page=${state.libPage}&size=${state.libSize}`);
+    state.libTotal = data.total;
+    renderPagination(data);
+    if (!data.items.length) {
+      list.innerHTML =
+        '<p class="hint-inline">还没有任何已转语音的文档。<a href="#/upload">去上传一个 .md</a>。</p>';
+      return;
+    }
+    list.innerHTML = data.items
+      .map((it) => {
+        const sizeKB = (it.byte_size / 1024).toFixed(1);
+        const voice = it.voice_id || "—";
+        return `
+          <div class="library-item">
+            <button class="btn btn-primary lib-play" data-action="play" data-id="${it.audio_id}" type="button">▶ 播放</button>
+            <span class="lib-name" title="${escapeHtml(it.original_filename)}">${escapeHtml(it.original_filename)}</span>
+            <span class="lib-meta">voice: ${escapeHtml(voice)} · ${sizeKB} KB · ${escapeHtml(it.created_at)}</span>
+          </div>
+        `;
+      })
+      .join("");
+
+    list.querySelectorAll(".lib-play").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        location.hash = `#/play/${btn.dataset.id}`;
+      });
+    });
+  } catch (e) {
+    list.innerHTML = `<p class="hint-inline error">加载失败: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+function renderPagination(data) {
+  const totalPages = Math.max(1, Math.ceil(data.total / data.size));
+  $("libPageInfo").textContent = `第 ${data.page} / ${totalPages} 页 · 共 ${data.total} 条`;
+  $("libPrev").disabled = data.page <= 1;
+  $("libNext").disabled = data.page >= totalPages;
+}
+
+// ---- View: 播放详情 ------------------------------------------------------
+
+async function renderPlay(audioId) {
+  const titleEl = $("playTitle");
+  const metaEl = $("playMeta");
+  const contentEl = $("playContent");
+  const audioEl = $("playAudio");
+
+  titleEl.textContent = "加载中…";
+  metaEl.textContent = "—";
+  contentEl.innerHTML = '<p class="hint-inline">加载中…</p>';
+
+  // Pause any previous playback and reset src so listeners don't double-fire.
+  audioEl.pause();
+  audioEl.removeAttribute("src");
+  audioEl.load();
+
+  let detail;
+  try {
+    detail = await api(`/api/library/${audioId}`);
+  } catch (e) {
+    titleEl.textContent = "加载失败";
+    contentEl.innerHTML = `<p class="hint-inline error">${escapeHtml(e.message)}</p>`;
+    return;
+  }
+  state.playDetail = detail;
+
+  titleEl.textContent = detail.original_filename;
+  metaEl.textContent =
+    `voice: ${detail.voice_id || "—"} · ${(detail.byte_size / 1024).toFixed(1)} KB · ${detail.created_at} · id ${detail.audio_id.slice(0, 8)}`;
+
+  // Split normalized text into segments on blank lines; drop empties.
+  const segments = (detail.normalized_md || "")
+    .split(/\n\s*\n/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (!segments.length) {
+    contentEl.innerHTML = '<p class="hint-inline">该文档没有可显示的 normalized 文本。</p>';
+    return;
+  }
+
+  contentEl.innerHTML = segments
+    .map((s, i) => `<p class="segment" data-idx="${i}">${escapeHtml(s).replace(/\n/g, "<br>")}</p>`)
+    .join("");
+
+  audioEl.src = detail.audio_url;
+  audioEl.addEventListener("loadedmetadata", () => setupPlayHighlight(audioEl, segments), { once: true });
+}
+
+function setupPlayHighlight(audioEl, segments) {
+  const dur = audioEl.duration && isFinite(audioEl.duration) ? audioEl.duration : 0;
+  const segs = Array.from(document.querySelectorAll(".play-content .segment"));
+  if (!segs.length) return;
+
+  let startTimes;
+  if (dur <= 0 || segments.length === 0) {
+    startTimes = new Array(segments.length).fill(0);
+  } else {
+    startTimes = segments.map((_, i) => (dur * i) / segments.length);
+  }
+
+  function currentIdx() {
+    return segs.findIndex((s) => s.classList.contains("playing"));
+  }
+  function applyIdx(i) {
+    segs.forEach((el, k) => el.classList.toggle("playing", k === i));
+    segs[i].scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+  function update() {
+    const t = audioEl.currentTime || 0;
+    let idx = 0;
+    for (let i = 0; i < startTimes.length; i++) {
+      if (t >= startTimes[i]) idx = i;
+    }
+    if (!segs[idx].classList.contains("playing")) {
+      applyIdx(idx);
+    }
+  }
+
+  audioEl.addEventListener("timeupdate", update);
+  audioEl.addEventListener("ended", () => {
+    segs.forEach((s) => s.classList.remove("playing"));
+  });
+
+  $("playPrev").onclick = () => {
+    const cur = currentIdx();
+    const next = Math.max(0, cur < 0 ? 0 : cur - 1);
+    audioEl.currentTime = startTimes[next];
+    applyIdx(next);
+  };
+  $("playNext").onclick = () => {
+    const cur = currentIdx();
+    const next = Math.min(segments.length - 1, cur < 0 ? 0 : cur + 1);
+    audioEl.currentTime = startTimes[next];
+    applyIdx(next);
+  };
+  $("playRestart").onclick = () => {
+    audioEl.currentTime = 0;
+    audioEl.play().catch(() => {});
+    applyIdx(0);
+  };
+
+  // Initial highlight (so the first segment is visibly active even before play).
+  applyIdx(0);
 }
 
 // ---- Voice list ----------------------------------------------------------
@@ -65,8 +276,6 @@ function bindFilePicker() {
       const fd = new FormData();
       fd.append("file", f);
       const data = await api("/api/preview", { method: "POST", body: fd });
-      // /api/preview now returns {local_clean, normalized, length, source}
-      // The M3-normalized text is what TTS will receive.
       state.currentText = data.normalized || data.cleaned || "";
       $("cleanedPreview").value = state.currentText;
       $("textMeta").textContent =
@@ -103,16 +312,11 @@ async function loadSample() {
 const STAGE_ORDER = ["markdown_clean", "llm_normalize", "tts_synthesize", "audio_save"];
 
 function resetProgress() {
-  // Reset all 4 steps and the connector bars to "pending".
   STAGE_ORDER.forEach((stage) => {
     const step = document.querySelector(`.step[data-stage="${stage}"]`);
-    if (step) {
-      step.classList.remove("active", "done", "error");
-    }
+    if (step) step.classList.remove("active", "done", "error");
     const bar = document.querySelector(`.step-bar[data-bar="${stage}"]`);
-    if (bar) {
-      bar.classList.remove("active", "done", "error");
-    }
+    if (bar) bar.classList.remove("active", "done", "error");
   });
   const fill = $("progressBarFill");
   fill.style.width = "0%";
@@ -122,7 +326,6 @@ function resetProgress() {
 }
 
 function applyProgressEvent(ev) {
-  // ev shape: {stage, progress, message, audio_id, audio_url, error}
   const fill = $("progressBarFill");
   fill.style.width = `${Math.round(ev.progress * 100)}%`;
   $("progressPercent").textContent = `${Math.round(ev.progress * 100)}%`;
@@ -133,8 +336,6 @@ function applyProgressEvent(ev) {
 
   if (ev.stage === "error") {
     fill.classList.add("error");
-    // Mark the current pending step (the one that just failed) as error.
-    // Heuristic: find the first step not yet "done".
     for (const stage of STAGE_ORDER) {
       const step = document.querySelector(`.step[data-stage="${stage}"]`);
       if (step && !step.classList.contains("done")) {
@@ -157,32 +358,18 @@ function applyProgressEvent(ev) {
   }
 
   if (STAGE_ORDER.includes(ev.stage)) {
-    // Mark this stage active.
     const step = document.querySelector(`.step[data-stage="${ev.stage}"]`);
-    if (step) {
-      step.classList.add("active");
-    }
-    // Mark previous stages done + their connector bars.
+    if (step) step.classList.add("active");
     const idx = STAGE_ORDER.indexOf(ev.stage);
     for (let i = 0; i < idx; i++) {
       const s = document.querySelector(`.step[data-stage="${STAGE_ORDER[i]}"]`);
-      if (s) {
-        s.classList.remove("active");
-        s.classList.add("done");
-      }
+      if (s) { s.classList.remove("active"); s.classList.add("done"); }
       const b = document.querySelector(`.step-bar[data-bar="${STAGE_ORDER[i]}"]`);
-      if (b) {
-        b.classList.remove("active");
-        b.classList.add("done");
-      }
+      if (b) { b.classList.remove("active"); b.classList.add("done"); }
     }
-    // Activate the connector bar leading into this stage.
     if (idx > 0) {
       const bar = document.querySelector(`.step-bar[data-bar="${STAGE_ORDER[idx - 1]}"]`);
-      if (bar) {
-        bar.classList.remove("done");
-        bar.classList.add("active");
-      }
+      if (bar) { bar.classList.remove("done"); bar.classList.add("active"); }
     }
   }
 }
@@ -203,13 +390,10 @@ async function synthesize() {
   const btn = $("synthBtn");
   btn.disabled = true;
 
-  // Show + reset the progress UI.
   const wrap = $("progressWrap");
   wrap.hidden = false;
   resetProgress();
 
-  // Build the request body. EventSource doesn't accept a body, so we POST
-  // via fetch streaming (text/event-stream) instead.
   const fd = new FormData();
   fd.append("file", state.currentFile);
   const voiceId = $("voiceSelect").value;
@@ -245,7 +429,6 @@ async function synthesize() {
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
 
-      // SSE frames are separated by blank lines; split and process each.
       let idx;
       while ((idx = buffer.indexOf("\n\n")) !== -1) {
         const frame = buffer.slice(0, idx);
@@ -275,7 +458,6 @@ async function synthesize() {
 
   if (errored || !finalEvent) return;
 
-  // Hide progress, show player + download row.
   const player = $("player");
   player.src = finalEvent.audio_url;
   player.hidden = false;
@@ -296,8 +478,7 @@ async function synthesize() {
     at: new Date().toLocaleTimeString(),
   });
 
-  setStatus("✅ 已生成，可以重听");
-  }
+  setStatus("✅ 已生成，可以重听 · 也可以去「听文档」页查看");
 }
 
 function pushHistory(item) {
@@ -310,13 +491,31 @@ function pushHistory(item) {
     li.className = "history-item";
     li.innerHTML = `
       <span class="hist-time">${h.at}</span>
-      <span class="hist-file">${h.file}</span>
-      <span class="hist-voice">${h.voice}</span>
+      <span class="hist-file">${escapeHtml(h.file)}</span>
+      <span class="hist-voice">${escapeHtml(h.voice)}</span>
       <audio controls src="${h.url}"></audio>
-      <a class="btn btn-mini" href="${h.url}" download="${h.file.replace(/\.[^.]+$/, "")}_${h.id}.mp3">下载</a>
+      <a class="btn btn-mini" href="${h.url}" download="${escapeHtml(h.file.replace(/\.[^.]+$/, ""))}_${h.id}.mp3">下载</a>
     `;
     ol.appendChild(li);
   }
+}
+
+// ---- Pagination controls ------------------------------------------------
+
+function bindPagination() {
+  $("libPrev").addEventListener("click", () => {
+    if (state.libPage > 1) {
+      state.libPage -= 1;
+      renderListen();
+    }
+  });
+  $("libNext").addEventListener("click", () => {
+    const totalPages = Math.max(1, Math.ceil(state.libTotal / state.libSize));
+    if (state.libPage < totalPages) {
+      state.libPage += 1;
+      renderListen();
+    }
+  });
 }
 
 // ---- Health / status ----------------------------------------------------
@@ -362,12 +561,19 @@ function setStatus(msg, kind = "info") {
 
 document.addEventListener("DOMContentLoaded", () => {
   bindFilePicker();
+  bindPagination();
   $("synthBtn").addEventListener("click", synthesize);
   $("refreshVoicesBtn").addEventListener("click", loadVoices);
   $("loadSampleBtn").addEventListener("click", loadSample);
   $("speedRange").addEventListener("input", (e) => {
     $("speedLabel").textContent = `${(+e.target.value).toFixed(1)}×`;
   });
+  window.addEventListener("hashchange", router);
+
+  // Force default route if none is present.
+  if (!location.hash) location.hash = "#/";
+
   checkHealth();
   loadVoices();
+  router();
 });

@@ -12,14 +12,19 @@ Stage weights (sum to 1.0):
 
 The exact weights are UI hints only; stages are still gated on actual
 completion, so the UI never advances before the next stage truly begins.
+
+After a successful ``audio_save`` we also insert a metadata row into the
+``LibraryStore`` SQLite index so the 「听文档」 feature can list and
+replay the result.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
-from app.services.audio_storage import AudioStorageService
+from app.services.audio_storage import AudioRecord, AudioStorageService, LibraryStore
 from app.services.llm_normalizer import LlmNormalizationError, LlmNormalizer
 from app.services.markdown_service import MarkdownService
 from app.services.tts_client import TtsApiError, TtsClient
@@ -69,11 +74,13 @@ class TtsPipeline:
         llm: LlmNormalizer,
         tts: TtsClient,
         audio: AudioStorageService,
+        library: Optional[LibraryStore] = None,
     ) -> None:
         self._md = markdown
         self._llm = llm
         self._tts = tts
         self._audio = audio
+        self._library = library  # may be None in legacy/test wiring
 
     async def run(
         self,
@@ -168,6 +175,24 @@ class TtsPipeline:
         yield ProgressEvent(stage="audio_save", progress=hi,
                             message="保存完成",
                             audio_id=stored.audio_id)
+
+        # ---- 4b. library index (听文档 metadata) -------------------------
+        # Failures here are non-fatal: we don't want a broken index to abort
+        # a successful synthesis. Log and move on.
+        if self._library is not None:
+            try:
+                self._library.insert(AudioRecord(
+                    audio_id=stored.audio_id,
+                    original_filename=filename,
+                    original_md=markdown_text,
+                    normalized_md=normalized,
+                    voice_id=voice_id or default_voice_id,
+                    duration_sec=None,  # filled later by client / browser
+                    byte_size=len(audio_bytes),
+                    created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                ))
+            except Exception:
+                logger.exception("library insert failed for %s", stored.audio_id)
 
         # ---- done ----
         yield ProgressEvent(

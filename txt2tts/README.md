@@ -33,12 +33,12 @@ GET /api/audio/{audio_id}              ← 浏览器 <audio> 流式播放
 
 ## 功能
 
-- 📁 选择本地 `.md` 文件（也支持 `.markdown` / `.txt`）
-- 🧹 本地清洗 + **MiniMax M3** LLM 标准化
-- 🎙️ **小米 MiMo mimo-v2.5-tts** 多语音合成
-- 💾 MP3 持久化到 `outputs/<日期>/<uuid>.mp3`
+- 🎧 **「听文档」菜单**（默认进入）：分页列出已成功转语音的 MD 文档，每行点 ▶ 播放进入详情页，随播放高亮当前段
+- 📝 **「上传转语音」菜单**：选择本地 `.md`（也支持 `.markdown` / `.txt`）→ 本地清洗 + **MiniMax M3** LLM 标准化
+- 🎙️ **小米 MiMo `mimo-v2.5-tts`** 多语音合成（9 个已验证 voice_id）
+- 💾 MP3 持久化到 `outputs/<日期>/<uuid>.mp3`，元数据写入 SQLite `outputs/library.db`
 - ▶️ 内置播放器（支持进度条拖动 + 下载）
-- 📜 最近 10 条会话历史
+- 📜 最近 10 条会话历史（仅本浏览器会话）
 
 ## 快速开始
 
@@ -125,6 +125,8 @@ UI 会自动列出全部 9 个选项。
 | `POST` | `/api/synthesize`         | 完整 pipeline：M3 → TTS → 落盘 |
 | `GET`  | `/api/audio/{audio_id}`   | 流式播放 MP3 |
 | `GET`  | `/api/storage/stats`      | outputs/ 占用统计 |
+| `GET`  | `/api/library`            | 听文档列表分页（`?page=N&size=10`，按 `created_at` 倒序） |
+| `GET`  | `/api/library/{audio_id}` | 听文档详情（含原文 + normalized） |
 | `GET`  | `/docs`                   | FastAPI Swagger UI |
 
 `POST /api/synthesize` 是 multipart/form-data：
@@ -135,6 +137,15 @@ curl -X POST http://127.0.0.1:8000/api/synthesize \
   -F "voice_id=冰糖"
 ```
 
+## 听文档（Library）
+
+前端是带 hash 路由的 SPA，**默认进入 `#/`（听文档）**，菜单可切换到 `#/upload`（上传转语音）。
+
+- **列表页 `#/`**：调用 `GET /api/library?page=N&size=10`，按 `created_at` 倒序分页。每行第一个操作是 ▶ 播放按钮，点击进入 `#/play/<audio_id>`。
+- **播放详情页 `#/play/<audio_id>`**：调用 `GET /api/library/{audio_id}` 拿到 `normalized_md`，按**空行**拆成段；`<audio>` 加载 `GET /api/audio/{audio_id}`。监听 `timeupdate`，按"等分时间表"（`duration ÷ 段数`）确定当前段并加 `.playing` 高亮。提供"上一段 / 下一段 / 重播"按钮。
+- **元数据**：合成成功后由 `TtsPipeline` 写入 SQLite 数据库 `outputs/library.db`（表 `audio_records`）。**旧 MP3 没有元数据**，列表里看不到，但文件本身仍可通过 `/api/audio/{id}` 访问。
+- **库文件位置**：`outputs/library.db`（已被 `.gitignore` 忽略）。
+
 ## 失败处理
 
 | 情况 | 行为 |
@@ -143,6 +154,7 @@ curl -X POST http://127.0.0.1:8000/api/synthesize \
 | MiMo TTS 调用失败 | 返回 502 |
 | 用户上传空 md | 返回 422 |
 | 上传 > 1MB | 返回 413 |
+| `GET /api/library/{audio_id}` 找不到 | 返回 404 |
 
 ## 真实端到端验证（已跑通）
 

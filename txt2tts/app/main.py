@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import get_settings
 from app.routers import tts as tts_router
-from app.services.audio_storage import AudioStorageService
+from app.services.audio_storage import AudioStorageService, LibraryStore
 from app.services.llm_normalizer import LlmNormalizer
 from app.services.markdown_service import MarkdownService
 from app.services.tts_client import TtsClient
@@ -53,13 +53,23 @@ async def lifespan(app: FastAPI):
     llm_svc = LlmNormalizer(settings.llm)
     tts_client = TtsClient(settings.tts)
     audio_svc = AudioStorageService(Path(settings.output_dir).resolve())
+    library_svc = LibraryStore(
+        Path(settings.output_dir).resolve() / settings.library_db_filename
+    )
 
-    tts_router.configure(markdown=md_svc, llm=llm_svc, tts=tts_client, audio=audio_svc)
+    tts_router.configure(
+        markdown=md_svc,
+        llm=llm_svc,
+        tts=tts_client,
+        audio=audio_svc,
+        library=library_svc,
+    )
 
     app.state.markdown = md_svc
     app.state.llm = llm_svc
     app.state.tts = tts_client
     app.state.audio = audio_svc
+    app.state.library = library_svc
 
     try:
         yield
