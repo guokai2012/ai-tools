@@ -12,7 +12,11 @@ markdown-it-py>=2.2
 langchain-core>=0.3
 langchain-anthropic>=0.3
 
+# 方案二：edge-tts 客户端（无需 API key）
+edge-tts>=7.0
+
 # Dev / test
 pytest>=8.4
 pytest-asyncio>=1.0
 respx>=0.21
+playwright>=1.40

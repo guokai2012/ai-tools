@@ -29,26 +29,54 @@ class FakeLlm:
 
 
 class FakeTts:
-    def __init__(self, fail: bool = False, audio: bytes = b"FAKEAUDIO"):
+    def __init__(self, fail: bool = False, audio: bytes = None):
+        from types import SimpleNamespace
         self._fail = fail
-        self._audio = audio
+        # 默认返回真实 mp3（0.3s 静音）以保证 ffmpeg concat 成功
+        self._audio = audio if audio is not None else _make_real_mp3(0.3)
+        self._settings = SimpleNamespace(max_input_chars_per_request=4500)
     async def synthesize(self, text: str, voice=None) -> bytes:
         if self._fail:
             raise TtsApiError("tts boom")
         return self._audio
 
 
+def _make_real_mp3(duration_sec: float = 0.3) -> bytes:
+    """生成一个真实 mp3 字节，供 ffmpeg concat 测试用。"""
+    import subprocess
+    from pathlib import Path
+    ffmpeg = Path(__file__).resolve().parent.parent / "bin" / "ffmpeg.exe"
+    if not ffmpeg.exists():
+        return b"FAKEAUDIO"  # fallback
+    out = subprocess.run(
+        [str(ffmpeg), "-y", "-f", "lavfi",
+         "-i", f"sine=frequency=440:duration={duration_sec}",
+         "-ar", "22050", "-ac", "1", "-codec:a", "libmp3lame", "-b:a", "64k",
+         "-f", "mp3", "pipe:1"],
+        check=True, capture_output=True,
+    )
+    return out.stdout
+
+
 class FakeAudio:
+    def __init__(self, root=None):
+        from pathlib import Path
+        import tempfile
+        self._root = Path(root) if root else Path(tempfile.gettempdir()) / "txt2tts_fake_audio"
+        self._root.mkdir(parents=True, exist_ok=True)
     def save(self, data: bytes) -> StoredAudio:
         return StoredAudio(audio_id="abc123", file_path=None)
 
 
-def _pipeline(md=None, llm=None, tts=None, audio=None) -> TtsPipeline:
+def _pipeline(md=None, llm=None, tts=None, audio=None, ffmpeg_path=None, ffprobe_path=None) -> TtsPipeline:
+    from pathlib import Path
     return TtsPipeline(
         md or FakeMd(),
         llm or FakeLlm(),
         tts or FakeTts(),
         audio or FakeAudio(),
+        ffmpeg_path=ffmpeg_path or Path(__file__).resolve().parent.parent / "bin" / "ffmpeg.exe",
+        ffprobe_path=ffprobe_path or Path(__file__).resolve().parent.parent / "bin" / "ffprobe.exe",
     )
 
 

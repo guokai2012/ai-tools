@@ -287,7 +287,8 @@ audio {
   align-items: center;
   gap: 4px;
   flex: 0 0 auto;
-  min-width: 64px;
+  min-width: 72px;
+  max-width: 120px;
 }
 
 .step-icon {
@@ -310,6 +311,10 @@ audio {
   color: var(--text-dim);
   white-space: nowrap;
   transition: color 0.2s;
+  text-align: center;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* segment connecting bar */
@@ -530,6 +535,12 @@ audio {
   flex-direction: column;
   gap: 16px;
 }
+/* hidden 属性必须始终生效（即使被 .view 的 display: flex 覆盖） */
+.view[hidden],
+[hidden] {
+  display: none !important;
+}
+}
 
 /* ---- 听文档 library list ------------------------------------------------ */
 .library-list {
@@ -609,6 +620,653 @@ audio {
   color: #fff;
 }
 
+/* ---- 音乐播放器模式：LRC 歌词同步 -------------------------------------- */
+.play-content.lyric-mode {
+  background: linear-gradient(180deg, var(--surface-2) 0%, var(--surface) 100%);
+  padding: 28px 24px;
+  text-align: center;
+  scroll-behavior: smooth;
+}
+.play-content.lyric-mode .lyric-line {
+  margin: 0 auto;
+  padding: 6px 0;
+  font-size: 15px;
+  line-height: 1.7;
+  color: var(--text-dim);
+  opacity: 0.55;
+  font-weight: 400;
+  transition: color 180ms ease, opacity 180ms ease, transform 180ms ease, font-size 180ms ease;
+  max-width: 640px;
+}
+.play-content.lyric-mode .lyric-line .lyric-text {
+  display: inline;
+}
+/* 当前播放行：高亮 + 放大 + 微缩放 */
+.play-content.lyric-mode .lyric-line.playing {
+  color: var(--primary);
+  opacity: 1;
+  font-size: 18px;
+  font-weight: 600;
+  transform: scale(1.02);
+  text-shadow: 0 0 18px rgba(46, 166, 255, 0.35);
+}
+/* 已经播过的行：更暗，方便眼睛锁定当前行 */
+.play-content.lyric-mode .lyric-line.past {
+  opacity: 0.3;
+  color: var(--text-dim);
+}
+/* 多行同时间时（罕见）允许换行显示 */
+.play-content.lyric-mode .lyric-line .lyric-text + br + .lyric-text {
+  display: inline-block;
+  margin-top: 2px;
+}
+
 .hint-inline.error {
   color: var(--err);
+}
+
+/* ---- 任务列表 ---------------------------------------------------------- */
+.task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.task-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  transition: border-color 120ms ease;
+}
+.task-item:hover {
+  border-color: var(--primary);
+}
+
+.task-item .status-badge {
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+.task-item .badge-ok { color: var(--ok); border-color: rgba(46, 204, 113, 0.3); }
+.task-item .badge-err { color: var(--err); border-color: rgba(231, 76, 60, 0.3); }
+.task-item .badge-processing {
+  color: var(--primary);
+  border-color: rgba(79, 140, 255, 0.3);
+  animation: pulse-badge 1.5s ease-in-out infinite;
+}
+.task-item .badge-pending { color: var(--text-dim); }
+
+@keyframes pulse-badge {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.6; }
+}
+
+.task-item .task-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.task-item .task-voice {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.task-item .task-progress {
+  flex: 0 0 48px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--primary);
+  font-variant-numeric: tabular-nums;
+}
+.task-item .task-time {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+/* ---- 对话框 overlay ----------------------------------------------------- */
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+/* hidden 属性 + position:fixed 仍可能拦截事件（hidden 仅是默认 display:none 但 fixed
+   元素在某些浏览器下需要显式 pointer-events:none 保险），确保彻底不命中 */
+.dialog-overlay[hidden] {
+  display: none;
+  pointer-events: none;
+}
+.dialog {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  width: 480px;
+  max-width: 90vw;
+  display: flex;
+  flex-direction: column;
+}
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+.dialog-header h3 {
+  margin: 0;
+  font-size: 15px;
+}
+.dialog-body {
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.dialog-footer {
+  padding: 12px 20px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* ---- 任务详情页 -------------------------------------------------------- */
+.task-error {
+  margin-top: 12px;
+  padding: 10px 14px;
+  background: rgba(231, 76, 60, 0.08);
+  border: 1px solid rgba(231, 76, 60, 0.25);
+  border-radius: var(--radius);
+  color: var(--err);
+  font-size: 13px;
+  word-break: break-word;
+}
+
+.task-done {
+  margin-top: 14px;
+  display: flex;
+  gap: 10px;
+}
+
+.task-retry {
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: rgba(245, 166, 35, 0.08);
+  border: 1px solid rgba(245, 166, 35, 0.3);
+  border-radius: var(--radius);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.task-retry .btn-primary {
+  background: var(--warn);
+  border-color: var(--warn);
+}
+.task-retry .btn-primary:hover {
+  background: #ffb84d;
+  border-color: #ffb84d;
+}
+.task-retry .hint-inline {
+  flex: 1;
+  min-width: 200px;
+}
+
+.retry-badge {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: rgba(245, 166, 35, 0.18);
+  color: var(--warn);
+  font-size: 10px;
+  font-weight: 700;
+  vertical-align: middle;
+}
+/* 转歌词功能已移除：原 .lyrics-preview / .lyrics-dialog / .lyrics-badge 样式全部删除。
+   详情页 LRC 由 edge provider 自动产出，在 .lyric-mode 下直接渲染。
+   见 styles.css 中 .play-content.lyric-mode 区块。 */
+
+/* ---- Provider 徽章 ----------------------------------------------------- */
+.provider-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  margin-right: 4px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+.provider-badge.provider-mimo {
+  background: rgba(79, 140, 255, 0.15);
+  color: var(--primary);
+  border: 1px solid rgba(79, 140, 255, 0.35);
+}
+.provider-badge.provider-edge {
+  background: rgba(46, 204, 113, 0.15);
+  color: var(--ok);
+  border: 1px solid rgba(46, 204, 113, 0.35);
+}
+
+/* ---- 系统设置 ---------------------------------------------------------- */
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.setting-block {
+  flex: 1;
+}
+.setting-label {
+  font-size: 12px;
+  color: var(--text-dim);
+  display: block;
+  margin-bottom: 4px;
+}
+.setting-current {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--primary);
+}
+.provider-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 12px 0 16px;
+}
+@media (max-width: 720px) {
+  .provider-grid {
+    grid-template-columns: 1fr;
+  }
+}
+.provider-card {
+  display: block;
+  padding: 14px 16px;
+  background: var(--surface-2);
+  border: 2px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+  position: relative;
+}
+.provider-card:hover {
+  border-color: var(--primary);
+}
+.provider-card input[type="radio"] {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.provider-card:has(input:checked) {
+  border-color: var(--primary);
+  background: rgba(79, 140, 255, 0.08);
+}
+.provider-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.provider-card-tag {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.provider-card ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.provider-card li code {
+  font-size: 11px;
+}
+.settings-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.status[data-kind="success"] { color: var(--ok); }
+
+
+/* ==========================================================================
+   移动端适配（≤ 720px）：菜单汉堡、列表单列、步骤纵向、安全区适配
+   ========================================================================== */
+
+:root {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --tap-min: 44px;            /* Apple HIG / Material 最小触摸目标 */
+}
+
+/* 默认让所有控件禁用 iOS 自动放大字号（输入框 < 16px 会触发） */
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+/* ---- 顶栏 / 菜单 ------------------------------------------------------- */
+@media (max-width: 720px) {
+  .topbar {
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: calc(10px + var(--safe-top)) calc(14px + var(--safe-right))
+             calc(10px + var(--safe-bottom)) calc(14px + var(--safe-left));
+  }
+  .topbar-left {
+    flex: 1 1 100%;
+    order: 1;
+  }
+  .topbar h1 {
+    font-size: 18px;
+  }
+  .subtitle {
+    display: none;            /* 小屏不显示副标题，节省空间 */
+  }
+  .topbar .menu {
+    order: 2;
+    flex: 1 1 auto;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .topbar .menu::-webkit-scrollbar { display: none; }
+  .menu-item {
+    padding: 8px 14px;
+    font-size: 14px;
+    white-space: nowrap;
+  }
+  #configBadge {
+    order: 3;
+    margin-left: auto;
+    font-size: 11px;
+    padding: 3px 8px;
+  }
+}
+
+/* ---- 容器 --------------------------------------------------------------- */
+@media (max-width: 720px) {
+  .container {
+    margin: 14px auto 30px;
+    padding: 0 calc(12px + var(--safe-left)) 0 calc(12px + var(--safe-right));
+    gap: 12px;
+  }
+  .card {
+    padding: 14px;
+    border-radius: 10px;
+  }
+  .card h2 {
+    font-size: 13px;
+  }
+}
+
+/* ---- 通用控件（按钮、输入框、行） --------------------------------------- */
+@media (max-width: 720px) {
+  /* 所有按钮至少 44px 高，符合触摸目标 */
+  .btn {
+    min-height: var(--tap-min);
+    padding: 10px 16px;
+    font-size: 15px;
+  }
+  .btn-mini {
+    min-height: 36px;
+    padding: 6px 12px;
+    font-size: 13px;
+  }
+  /* textarea / select / input 字号 16px，防止 iOS 自动放大 */
+  select, input[type="range"], textarea, input[type="text"], input[type="file"] {
+    font-size: 16px;
+  }
+  textarea {
+    min-height: 120px;
+  }
+  /* row 在窄屏改成可换行更松 */
+  .row {
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .select-wrap {
+    min-width: 0;
+  }
+  .select-wrap.narrow {
+    max-width: 100%;
+  }
+}
+
+/* ---- 听文档列表 --------------------------------------------------------- */
+@media (max-width: 720px) {
+  .library-item {
+    flex-wrap: wrap;
+    gap: 8px 10px;
+    padding: 12px;
+  }
+  .library-item .lib-play {
+    flex: 0 0 auto;
+    min-width: 88px;
+  }
+  .library-item .lib-name {
+    flex: 1 1 calc(100% - 100px);
+    order: 3;
+    font-size: 14px;
+  }
+  .library-item .lib-meta {
+    flex: 1 1 100%;
+    order: 4;
+    text-align: left;
+    font-size: 12px;
+  }
+}
+
+/* ---- 任务列表 ----------------------------------------------------------- */
+@media (max-width: 720px) {
+  .task-item {
+    flex-wrap: wrap;
+    gap: 6px 8px;
+    padding: 12px;
+  }
+  .task-item .status-badge {
+    order: 1;
+    font-size: 11px;
+    padding: 2px 8px;
+  }
+  .task-item .task-name {
+    order: 2;
+    flex: 1 1 calc(100% - 110px);
+    font-size: 14px;
+  }
+  .task-item .task-voice {
+    order: 3;
+    font-size: 11px;
+  }
+  .task-item .task-progress {
+    order: 4;
+    flex: 0 0 40px;
+    font-size: 12px;
+  }
+  .task-item .task-detail-btn {
+    order: 5;
+    margin-left: auto;
+  }
+  .task-item .task-time {
+    order: 6;
+    flex: 1 1 100%;
+    text-align: left;
+    font-size: 11px;
+    opacity: 0.8;
+  }
+}
+
+/* ---- 任务详情步骤条：≥900px 横向，<900px 改为纵向 ------------------------------ */
+/* 注意：mimo provider 是 6 步，6 步横向需要更宽的窗口；
+   此规则提前到 900px 触发纵向堆叠，避免挤压。整体页面移动布局仍以 720px 为准。 */
+@media (max-width: 900px) {
+  .step-progress {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0;
+  }
+  .step-progress .step {
+    flex-direction: row;
+    min-width: 0;
+    padding: 8px 4px;
+    gap: 12px;
+  }
+  .step-progress .step-bar {
+    width: 3px;
+    height: 18px;
+    margin: 0 auto;
+    flex: 0 0 18px;
+  }
+  .step-progress .step-label {
+    text-align: left;
+    flex: 1;
+    white-space: normal;       /* 纵向布局允许 label 换行 */
+    word-break: break-word;
+    overflow: visible;
+    text-overflow: clip;
+  }
+  /* 纵向条动画从横向 scaleX 改为纵向 scaleY */
+  .step-bar::after {
+    transform-origin: top;
+    transform: scaleY(0);
+  }
+  .step-bar.done::after,
+  .step-bar.active::after {
+    transform: scaleY(1);
+  }
+  .step.active .step-icon {
+    animation: none;             /* 横向 pulse 在纵向布局里怪 */
+  }
+}
+
+/* ---- 对话框：移动端几乎全屏 -------------------------------------------- */
+@media (max-width: 720px) {
+  .dialog-overlay {
+    align-items: flex-end;       /* 移动端从底部弹出 */
+    padding: 0;
+  }
+  .dialog {
+    width: 100%;
+    max-width: 100%;
+    border-radius: 16px 16px 0 0;
+    max-height: 92vh;
+    overflow-y: auto;
+    padding-bottom: var(--safe-bottom);
+  }
+  .dialog-header,
+  .dialog-body,
+  .dialog-footer {
+    padding-left: calc(16px + var(--safe-left));
+    padding-right: calc(16px + var(--safe-right));
+  }
+  .dialog-footer {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .dialog-footer .row {
+    flex: 1 1 100%;
+    margin-bottom: 0;
+  }
+  .dialog-footer #uploadStatus {
+    flex: 1 1 100%;
+    margin-bottom: 4px;
+  }
+}
+
+/* ---- 播放详情：按钮 + 段内容 ------------------------------------------- */
+@media (max-width: 720px) {
+  .play-content {
+    padding: 12px;
+    max-height: 50vh;
+    font-size: 15px;
+    line-height: 1.7;
+  }
+  .play-content .segment {
+    padding: 10px 12px;
+    font-size: 15px;
+  }
+  .play-content.lyric-mode {
+    padding: 18px 14px;
+  }
+  .play-content.lyric-mode .lyric-line {
+    font-size: 14px;
+  }
+  .play-content.lyric-mode .lyric-line.playing {
+    font-size: 16px;
+  }
+  .row:has(#playPrev),
+  .row:has(#playRestart) {
+    gap: 8px;
+  }
+  #playPrev, #playNext, #playRestart {
+    flex: 1 1 calc(50% - 8px);
+    min-width: 0;
+  }
+}
+
+/* ---- 顶部 padding（iOS 安全区） ---------------------------------------- */
+@media (max-width: 720px) {
+  body {
+    padding-top: var(--safe-top);
+  }
+  .footer {
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    padding: 0 calc(12px + var(--safe-left)) calc(20px + var(--safe-bottom))
+             calc(12px + var(--safe-right));
+    text-align: center;
+    justify-content: center;
+    font-size: 11px;
+  }
+}
+
+/* ---- 禁用 hover 在触屏设备上的高亮（避免粘滞） ----------------------- */
+@media (hover: none) and (max-width: 720px) {
+  .btn:hover,
+  .menu-item:hover,
+  .library-item:hover,
+  .task-item:hover {
+    background: initial;
+    border-color: initial;
+  }
+}
+
+/* ---- 超窄屏（≤ 360px）保险 -------------------------------------------- */
+@media (max-width: 360px) {
+  .topbar h1 { font-size: 16px; }
+  .menu-item { padding: 6px 10px; font-size: 13px; }
+  .card { padding: 12px; }
 }

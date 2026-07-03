@@ -1,0 +1,58 @@
+# docker-compose.yml —— 单服务部署 txt2tts
+#
+# 用法：
+#   1. cp .env.example .env，填入 LLM__API_KEY / TTS__API_KEY
+#   2. docker compose up -d --build
+#   3. 浏览器访问 http://localhost:8000
+#
+# 数据持久化（卷挂载）：
+#   - ./outputs  → /app/outputs   (MP3 + SRT + LRC + library.db)
+#   - ./samples  → /app/samples   (可选：放入示例 .md 用于演示)
+
+services:
+  txt2tts:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # 关闭 BuildKit 缓存提示；CI 上可以加 cache_from
+    image: txt2tts:latest
+    container_name: txt2tts
+    restart: unless-stopped
+    ports:
+      - "8000:8000"           # 浏览器访问 http://localhost:8000
+    env_file:
+      - .env                 # 读取 LLM__API_KEY / TTS__API_KEY 等
+    environment:
+      # 容器里默认 host 是 0.0.0.0（已在 Dockerfile CMD 设置）
+      APP__HOST: "0.0.0.0"
+      APP__PORT: "8000"
+      APP__OUTPUT_DIR: "/app/outputs"
+      APP__STATIC_DIR: "/app/app/static"
+      APP__LIBRARY_DB_FILENAME: "library.db"
+      # TTS Provider 切换（默认 mimo；想用 edge 把下面改成 edge）
+      APP__TTS_PROVIDER: "mimo"
+      # edge-tts 方案二：ffmpeg / ffprobe 在容器 /usr/local/bin/ 下
+      EDGE__FFMPEG_PATH: "/usr/local/bin/ffmpeg"
+      EDGE__FFPROBE_PATH: "/usr/local/bin/ffprobe"
+      EDGE__DEFAULT_VOICE: "zh-CN-XiaoxiaoNeural"
+      EDGE__RATE: "+0%"
+      EDGE__VOLUME: "+0%"
+      EDGE__PITCH: "+0Hz"
+      # 时区
+      TZ: "Asia/Shanghai"
+    volumes:
+      # 数据持久化：MP3、SRT、LRC、SQLite
+      - ./outputs:/app/outputs
+      # 可选：把样例 markdown 挂进容器（去掉这行不会影响运行）
+      - ./samples:/app/samples:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

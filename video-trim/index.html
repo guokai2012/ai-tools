@@ -1,0 +1,885 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>批量视频裁剪工具</title>
+    <!-- Tailwind CSS via CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+          theme: {
+            extend: {
+              colors: {
+                primary: '#3b82f6',
+                success: '#10b981'
+              }
+            }
+          }
+        }
+    </script>
+    <style>
+        .video-item input[type="checkbox"] {
+          accent-color: #3b82f6;
+        }
+        .output-item {
+          animation: fadeIn 0.3s ease-in;
+        }
+        @keyframes fadeIn {
+          from { opacity: 0; transform: translateY(5px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800">
+<div class="max-w-4xl mx-auto p-6">
+    <h1 class="text-2xl font-bold text-center mb-8 text-blue-700">🎬 批量视频裁剪工具</h1>
+
+    <!-- 待处理视频区域 -->
+    <div class="bg-white rounded-xl shadow-md p-6 mb-8">
+        <div class="flex justify-between items-center mb-4">
+            <h2 class="text-xl font-semibold">待处理视频</h2>
+            <div class="flex items-center gap-2">
+          <span id="selected-count" class="text-sm bg-blue-100 text-blue-800 px-2 py-1 rounded-full">
+            已选: 0
+          </span>
+                <button
+                        onclick="loadInputVideos()"
+                        id="refresh-input-btn"
+                        class="p-1.5 text-gray-500 hover:text-blue-600 rounded-full hover:bg-blue-50 transition"
+                        title="刷新待处理列表"
+                >
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24"
+                         stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                    </svg>
+                </button>
+            </div>
+        </div>
+        <div class="flex gap-2 mb-4">
+            <button onclick="toggleAll()" class="px-3 py-1 bg-gray-200 hover:bg-gray-300 rounded text-sm">全选</button>
+            <button onclick="clearAll()" class="px-3 py-1 bg-gray-200 hover:bg-gray-300 rounded text-sm">清空</button>
+        </div>
+        <div id="input-list" class="border border-gray-200 rounded-lg max-h-60 overflow-y-auto p-2 bg-gray-50">
+            <p class="text-gray-500 text-center py-4">加载中...</p>
+        </div>
+    </div>
+
+    <!-- 裁剪设置 -->
+    <div class="bg-white rounded-xl shadow-md p-6 mb-8">
+        <h2 class="text-xl font-semibold mb-4">✂️ 裁剪设置</h2>
+
+        <div class="mb-4">
+            <label class="block mb-2 font-medium">裁剪模式</label>
+            <div class="flex flex-col space-y-2">
+                <label class="inline-flex items-center">
+                    <input type="radio" name="mode" value="start" checked class="mr-2" onchange="handleModeChange()">
+                    <span>裁掉开头 N 秒（保留从第 N 秒到结尾）</span>
+                </label>
+                <label class="inline-flex items-center">
+                    <input type="radio" name="mode" value="end" class="mr-2" onchange="handleModeChange()">
+                    <span>裁掉结尾 N 秒（保留从开头到倒数第 N 秒）</span>
+                </label>
+                <label class="inline-flex items-center">
+                    <input type="radio" name="mode" value="middle" class="mr-2" onchange="handleModeChange()">
+                    <span>中间剪切（从N秒开始减掉M秒）</span>
+                </label>
+                <label class="inline-flex items-center">
+                    <input type="radio" name="mode" value="extract" class="mr-2" onchange="handleModeChange()">
+                    <span>提取段落（从N秒开始保留M秒）</span>
+                </label>
+                <label class="inline-flex items-center">
+                    <input type="radio" name="mode" value="ad_remove" class="mr-2" onchange="handleModeChange()">
+                    <span>移除广告（图像哈希匹配定位）</span>
+                </label>
+                <label class="inline-flex items-center">
+                    <input type="radio" name="mode" value="sample_split" class="mr-2" onchange="handleModeChange()">
+                    <span>按样本图片分割视频</span>
+                </label>
+                <label class="inline-flex items-center">
+                    <input type="radio" name="mode" value="watermark_remove" class="mr-2" onchange="handleModeChange()">
+                    <span>去除水印</span>
+                </label>
+            </div>
+        </div>
+
+        <!-- 单值输入（用于start/end模式）-->
+        <div id="single-duration-input" class="mb-4">
+            <label class="block mb-2 font-medium">裁剪时长（秒）</label>
+            <input
+                    type="number"
+                    id="duration"
+                    value="15"
+                    min="0.1"
+                    step="0.1"
+                    placeholder="例如：15.0"
+                    class="w-32 px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+            <p class="text-sm text-gray-500 mt-1">支持一位小数，如 7.5</p>
+        </div>
+
+        <!-- 多段输入（用于middle模式）-->
+        <div id="multi-duration-input" class="mb-4 hidden">
+            <label class="block mb-2 font-medium">剪切段设置</label>
+            <div id="segments-container">
+                <div class="segment-row flex gap-2 mb-2">
+                    <input type="number" placeholder="起始秒数" min="0" step="0.1"
+                           class="segment-start flex-1 px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    <input type="number" placeholder="剪切时长" min="0.1" step="0.1"
+                           class="segment-duration flex-1 px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    <button type="button" onclick="removeSegment(this)"
+                            class="px-3 bg-red-500 text-white rounded hover:bg-red-600">-
+                    </button>
+                </div>
+            </div>
+            <button type="button" onclick="addSegment()"
+                    class="px-3 py-1 bg-gray-200 hover:bg-gray-300 rounded text-sm">+ 添加段
+            </button>
+            <p class="text-sm text-gray-500 mt-1">支持一位小数，如 7.5</p>
+        </div>
+
+        <!-- 提取段输入（用于extract模式）-->
+        <div id="extract-input" class="mb-4 hidden">
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label class="block mb-2 font-medium">起始时间（秒）</label>
+                    <input
+                            type="number"
+                            id="extract-start"
+                            value="10"
+                            min="0"
+                            step="0.1"
+                            placeholder="例如：10.0"
+                            class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                </div>
+                <div>
+                    <label class="block mb-2 font-medium">保留时长（秒）</label>
+                    <input
+                            type="number"
+                            id="extract-duration"
+                            value="15"
+                            min="0.1"
+                            step="0.1"
+                            placeholder="例如：15.0"
+                            class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                </div>
+            </div>
+            <p class="text-sm text-gray-500 mt-1">支持一位小数，如 7.5</p>
+        </div>
+
+        <!-- 广告移除输入（用于ad_remove模式）-->
+        <div id="ad-remove-input" class="mb-4 hidden">
+            <div class="grid grid-cols-1 gap-4">
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block mb-2 font-medium">搜索窗口起始（秒）</label>
+                        <input
+                                type="number"
+                                id="search-window-start"
+                                value="0"
+                                min="0"
+                                step="0.1"
+                                class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                    </div>
+                    <div>
+                        <label class="block mb-2 font-medium">搜索窗口结束（秒）</label>
+                        <input
+                                type="number"
+                                id="search-window-end"
+                                value="60"
+                                min="0"
+                                step="0.1"
+                                class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block mb-2 font-medium">广告时长（秒）</label>
+                        <input
+                                type="number"
+                                id="ad-duration"
+                                value="20.0"
+                                min="0.1"
+                                step="0.1"
+                                class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                    </div>
+                    <div>
+                        <label class="block mb-2 font-medium">图像哈希对比阈值</label>
+                        <input
+                                type="number"
+                                id="hash-threshold"
+                                value="0.8"
+                                min="0.1"
+                                max="1"
+                                step="0.01"
+                                class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block mb-2 font-medium">连续对比帧数</label>
+                        <input
+                                type="number"
+                                id="consecutive-frames"
+                                value="3"
+                                min="1"
+                                step="1"
+                                class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                    </div>
+                    <div>
+                        <label class="block mb-2 font-medium">帧提取步长（秒）</label>
+                        <input
+                                type="number"
+                                id="frame-step"
+                                value="0.5"
+                                min="0.1"
+                                step="0.1"
+                                class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                        <p class="text-sm text-gray-500 mt-1">帧提取的时间间隔</p>
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block mb-2 font-medium">时间调整（秒）</label>
+                    <input
+                            type="number"
+                            id="time-adjust"
+                            value="0.0"
+                            step="0.1"
+                            placeholder="例如：0.5 或 -0.3"
+                            class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                    <p class="text-sm text-gray-500 mt-1">对检测到的广告开始时间进行调整，支持正负数（秒）</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- 样本图片分割输入（用于sample_split模式）-->
+        <div id="sample-split-input" class="mb-4 hidden">
+            <div class="grid grid-cols-1 gap-4">
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block mb-2 font-medium">图像哈希对比阈值</label>
+                        <input
+                                type="number"
+                                id="sample-hash-threshold"
+                                value="0.8"
+                                min="0.1"
+                                max="1"
+                                step="0.01"
+                                class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                    </div>
+                    <div>
+                        <label class="block mb-2 font-medium">连续对比帧数</label>
+                        <input
+                                type="number"
+                                id="sample-consecutive-frames"
+                                value="3"
+                                min="1"
+                                step="1"
+                                class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block mb-2 font-medium">帧提取步长（秒）</label>
+                        <input
+                                type="number"
+                                id="sample-frame-step"
+                                value="0.5"
+                                min="0.1"
+                                step="0.1"
+                                class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                        <p class="text-sm text-gray-500 mt-1">帧提取的时间间隔</p>
+                    </div>
+                    <div>
+                        <label class="block mb-2 font-medium">跳过间隔（秒）</label>
+                        <input
+                                type="number"
+                                id="sample-skip-interval"
+                                value="30.0"
+                                min="1.0"
+                                step="1.0"
+                                class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                        <p class="text-sm text-gray-500 mt-1">连续不匹配时跳过的时间，可加快处理速度</p>
+                    </div>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                  <div>
+                        <label class="block mb-2 font-medium">搜索持续秒（秒）</label>
+                        <input
+                                type="number"
+                                id="sample-search-duration"
+                                value="10.0"
+                                min="1.0"
+                                step="1.0"
+                                class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                        <p class="text-sm text-gray-500 mt-1">每次搜索的持续时间</p>
+                    </div>
+                    <div>
+                        <label class="block mb-2 font-medium">时间调整（秒）</label>
+                        <input
+                                type="number"
+                                id="sample-time-adjust"
+                                value="0.0"
+                                step="0.1"
+                                placeholder="例如：0.5 或 -0.3"
+                                class="w-full px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                        <p class="text-sm text-gray-500 mt-1">对检测到的分割点进行调整，支持正负数（秒）</p>
+                    </div>
+                    <div></div>
+                </div>
+
+                <div class="text-sm text-gray-500">
+                    <p>样本图片默认使用 /videos/sample/split_sample.png，请确保该文件存在</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- 水印去除输入（用于watermark_remove模式）-->
+        <div id="watermark-remove-input" class="mb-4 hidden">
+            <div class="grid grid-cols-1 gap-4">
+                <label class="block mb-2 font-medium">水印参数设置</label>
+                <div id="watermark-params-container">
+                    <div class="watermark-row grid grid-cols-6 gap-2 mb-4 p-3 bg-gray-50 rounded-lg">
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600 mb-1">开始时间（秒）</label>
+                            <input type="number" placeholder="0" min="0" step="0.1"
+                                   class="watermark-start w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600 mb-1">结束时间（秒）</label>
+                            <input type="number" placeholder="10" min="0.1" step="0.1"
+                                   class="watermark-end w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600 mb-1">左上X</label>
+                            <input type="number" placeholder="100" min="0" step="1"
+                                   class="watermark-x1 w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600 mb-1">左上Y</label>
+                            <input type="number" placeholder="50" min="0" step="1"
+                                   class="watermark-y1 w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600 mb-1">宽度</label>
+                            <input type="number" placeholder="100" min="1" step="1"
+                                   class="watermark-w w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-medium text-gray-600 mb-1">高度</label>
+                            <input type="number" placeholder="50" min="1" step="1"
+                                   class="watermark-h w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+                        </div>
+                        <div class="col-span-6 flex justify-end">
+                            <button type="button" onclick="removeWatermarkRow(this)"
+                                    class="px-3 py-1 bg-red-500 text-white rounded hover:bg-red-600 text-sm">
+                                删除
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                <button type="button" onclick="addWatermarkRow()"
+                        class="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition text-sm">
+                    + 添加水印参数
+                </button>
+                <p class="text-sm text-gray-500">
+                    水印参数说明：
+                    <br>1. 开始时间：水印出现的开始时间
+                    <br>2. 结束时间：水印消失的结束时间
+                    <br>3. 左上坐标（X1,Y1）：水印区域左上角坐标
+                    <br>4. 右下坐标（X2,Y2）：水印区域右下角坐标
+                    <br>5. 可添加多条参数处理不同时间段的水印
+                </p>
+            </div>
+        </div>
+
+        <button
+                onclick="startTrim()"
+                class="px-5 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition font-medium"
+        >
+            开始裁剪
+        </button>
+        <span id="status" class="ml-3 text-green-600 font-medium"></span>
+    </div>
+
+    <!-- 已完成视频区域 -->
+    <div class="bg-white rounded-xl shadow-md p-6">
+        <div class="flex justify-between items-center mb-4">
+            <h2 class="text-xl font-semibold">✅ 已完成视频（每10秒自动刷新）</h2>
+            <button
+                    onclick="loadOutputVideos()"
+                    id="refresh-output-btn"
+                    class="p-1.5 text-gray-500 hover:text-green-600 rounded-full hover:bg-green-50 transition"
+                    title="刷新已完成列表"
+            >
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24"
+                     stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                </svg>
+            </button>
+        </div>
+        <div id="output-list" class="border border-gray-200 rounded-lg max-h-60 overflow-y-auto p-2 bg-gray-50">
+            加载中...
+        </div>
+    </div>
+</div>
+
+<script>
+    let allFiles = [];
+    let selectedFiles = new Set();
+
+    // 加载待处理视频列表
+    async function loadInputVideos() {
+      const btn = document.getElementById('refresh-input-btn');
+      const originalSVG = btn.innerHTML;
+      btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path stroke="currentColor" stroke-width="2" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 6.627 5.373 12 12 12v-4a8 8 0 01-10-7.709z"/></svg>';
+      btn.disabled = true;
+
+      try {
+        const res = await fetch('/api/videos');
+        allFiles = await res.json();
+        renderInputList();
+      } catch (e) {
+        console.error('加载待处理视频失败', e);
+        document.getElementById('input-list').innerHTML = '<p class="text-red-500 text-center py-4">加载失败，请检查服务是否运行</p>';
+      } finally {
+        btn.innerHTML = originalSVG;
+        btn.disabled = false;
+      }
+    }
+
+    function renderInputList() {
+      const div = document.getElementById('input-list');
+      if (allFiles.length === 0) {
+        div.innerHTML = '<p class="text-center text-gray-500 py-4">videos/input 目录中没有视频文件</p>';
+        return;
+      }
+      div.innerHTML = allFiles.map(file => `
+        <div class="video-item flex items-center p-2 hover:bg-white rounded cursor-pointer border-b border-gray-100 last:border-0">
+          <input type="checkbox" value="${file}" onchange="toggleFile(this)" class="mr-3">
+          <span class="font-mono text-sm">${file}</span>
+        </div>
+      `).join('');
+      updateSelectedCount();
+    }
+
+    function toggleFile(checkbox) {
+      checkbox.checked ? selectedFiles.add(checkbox.value) : selectedFiles.delete(checkbox.value);
+      updateSelectedCount();
+    }
+
+    function toggleAll() {
+      selectedFiles = new Set(allFiles);
+      renderInputList();
+    }
+
+    function clearAll() {
+      selectedFiles.clear();
+      renderInputList();
+    }
+
+    function updateSelectedCount() {
+      document.getElementById('selected-count').textContent = `已选: ${selectedFiles.size}`;
+      document.querySelectorAll('#input-list input[type="checkbox"]').forEach(cb => {
+        cb.checked = selectedFiles.has(cb.value);
+      });
+    }
+
+    // 加载已完成视频列表
+    async function loadOutputVideos() {
+      const btn = document.getElementById('refresh-output-btn');
+      const originalSVG = btn.innerHTML;
+      btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/><path stroke="currentColor" stroke-width="2" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 6.627 5.373 12 12 12v-4a8 8 0 01-10-7.709z"/></svg>';
+      btn.disabled = true;
+
+      try {
+        const res = await fetch('/api/outputs');
+        const outputs = await res.json();
+        const div = document.getElementById('output-list');
+        if (outputs.length === 0) {
+          div.innerHTML = '<p class="text-center text-gray-500 py-4">暂无已完成的视频</p>';
+        } else {
+          div.innerHTML = outputs.map(f => `
+            <div class="output-item p-2 border-b border-gray-100 last:border-0 font-mono text-sm text-green-700">
+              ✅ ${f}
+            </div>
+          `).join('');
+        }
+      } catch (e) {
+        document.getElementById('output-list').innerHTML = '<p class="text-red-500 text-center py-4">加载失败</p>';
+      } finally {
+        btn.innerHTML = originalSVG;
+        btn.disabled = false;
+      }
+    }
+
+    function handleModeChange() {
+      const mode = document.querySelector('input[name="mode"]:checked').value;
+      const singleInput = document.getElementById('single-duration-input');
+      const multiInput = document.getElementById('multi-duration-input');
+      const extractInput = document.getElementById('extract-input');
+      const adRemoveInput = document.getElementById('ad-remove-input');
+      const sampleSplitInput = document.getElementById('sample-split-input');
+      const watermarkRemoveInput = document.getElementById('watermark-remove-input');
+      
+      // 隐藏所有输入区域
+      singleInput.classList.add('hidden');
+      multiInput.classList.add('hidden');
+      extractInput.classList.add('hidden');
+      adRemoveInput.classList.add('hidden');
+      sampleSplitInput.classList.add('hidden');
+      watermarkRemoveInput.classList.add('hidden');
+      
+      // 根据模式显示对应输入区域
+      if (mode === 'middle') {
+        multiInput.classList.remove('hidden');
+      } else if (mode === 'extract') {
+        extractInput.classList.remove('hidden');
+      } else if (mode === 'ad_remove') {
+        adRemoveInput.classList.remove('hidden');
+      } else if (mode === 'sample_split') {
+        sampleSplitInput.classList.remove('hidden');
+      } else if (mode === 'watermark_remove') {
+        watermarkRemoveInput.classList.remove('hidden');
+      } else {
+        singleInput.classList.remove('hidden');
+      }
+    }
+
+    function addSegment() {
+      const container = document.getElementById('segments-container');
+      const newRow = document.createElement('div');
+      newRow.className = 'segment-row flex gap-2 mb-2';
+      newRow.innerHTML = `
+        <input type="number" placeholder="起始秒数" min="0" step="0.1" class="segment-start flex-1 px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+        <input type="number" placeholder="剪切时长" min="0.1" step="0.1" class="segment-duration flex-1 px-3 py-2 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+        <button type="button" onclick="removeSegment(this)" class="px-3 bg-red-500 text-white rounded hover:bg-red-600">-</button>
+      `;
+      container.appendChild(newRow);
+    }
+
+    function removeSegment(button) {
+      const row = button.parentElement;
+      if (document.querySelectorAll('.segment-row').length > 1) {
+        row.remove();
+      } else {
+        alert('至少需要保留一个段');
+      }
+    }
+
+    // 水印参数行管理
+    function addWatermarkRow() {
+      const container = document.getElementById('watermark-params-container');
+      const newRow = document.createElement('div');
+      newRow.className = 'watermark-row grid grid-cols-6 gap-2 mb-4 p-3 bg-gray-50 rounded-lg';
+      newRow.innerHTML = `
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">开始时间（秒）</label>
+          <input type="number" placeholder="0" min="0" step="0.1"
+                 class="watermark-start w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">结束时间（秒）</label>
+          <input type="number" placeholder="10" min="0.1" step="0.1"
+                 class="watermark-end w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">左上X</label>
+          <input type="number" placeholder="100" min="0" step="1"
+                 class="watermark-x1 w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">左上Y</label>
+          <input type="number" placeholder="50" min="0" step="1"
+                 class="watermark-y1 w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">宽度</label>
+          <input type="number" placeholder="100" min="1" step="1"
+                 class="watermark-w w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-1">高度</label>
+          <input type="number" placeholder="50" min="1" step="1"
+                 class="watermark-h w-full px-2 py-1 border border-gray-300 rounded focus:outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <div class="col-span-6 flex justify-end">
+          <button type="button" onclick="removeWatermarkRow(this)"
+                  class="px-3 py-1 bg-red-500 text-white rounded hover:bg-red-600 text-sm">
+            删除
+          </button>
+        </div>
+      `;
+      container.appendChild(newRow);
+    }
+
+    function removeWatermarkRow(button) {
+      const row = button.parentElement.parentElement;
+      if (document.querySelectorAll('.watermark-row').length > 1) {
+        row.remove();
+      } else {
+        alert('至少需要保留一个水印参数');
+      }
+    }
+
+    // 开始裁剪
+    async function startTrim() {
+      if (selectedFiles.size === 0) {
+        alert('请至少选择一个视频');
+        return;
+      }
+
+      const mode = document.querySelector('input[name="mode"]:checked').value;
+      let requestData = {
+        filenames: Array.from(selectedFiles),
+        mode: mode
+      };
+
+      if (mode === 'middle') {
+        const segments = [];
+        const rows = document.querySelectorAll('.segment-row');
+        let valid = true;
+        
+        rows.forEach(row => {
+          const startInput = row.querySelector('.segment-start');
+          const durationInput = row.querySelector('.segment-duration');
+          
+          const start = parseFloat(startInput.value);
+          const duration = parseFloat(durationInput.value);
+          
+          if (isNaN(start) || isNaN(duration) || start < 0 || duration <= 0) {
+            valid = false;
+            return;
+          }
+          
+          segments.push([start, duration]);
+        });
+        
+        if (!valid) {
+          alert('请填写有效的起始时间和剪切时长（起始时间>=0，时长>0）');
+          return;
+        }
+        
+        requestData.segments = segments;
+      } else if (mode === 'extract') {
+        const start = parseFloat(document.getElementById('extract-start').value);
+        const duration = parseFloat(document.getElementById('extract-duration').value);
+        
+        if (isNaN(start) || start < 0) {
+          alert('请输入有效的起始时间（>=0）');
+          return;
+        }
+        
+        if (isNaN(duration) || duration <= 0) {
+          alert('请输入有效的保留时长（>0）');
+          return;
+        }
+        
+        requestData.start = start;
+        requestData.duration = duration;
+      } else if (mode === 'ad_remove') {
+        const searchWindowStart = parseFloat(document.getElementById('search-window-start').value);
+        const searchWindowEnd = parseFloat(document.getElementById('search-window-end').value);
+        const adDuration = parseFloat(document.getElementById('ad-duration').value);
+        const hashThreshold = parseFloat(document.getElementById('hash-threshold').value);
+        const consecutiveFrames = parseInt(document.getElementById('consecutive-frames').value);
+        const frameStep = parseFloat(document.getElementById('frame-step').value) || 0.5;  // 获取帧提取步长参数
+        const timeAdjust = parseFloat(document.getElementById('time-adjust').value) || 0.0;  // 获取时间调整参数
+        if (isNaN(searchWindowStart) || searchWindowStart < 0) {
+          alert('请输入有效的搜索窗口起始时间（>=0）');
+          return;
+        }
+        
+        if (isNaN(searchWindowEnd) || searchWindowEnd <= searchWindowStart) {
+          alert('请输入有效的搜索窗口结束时间（>起始时间）');
+          return;
+        }
+        
+        if (isNaN(adDuration) || adDuration <= 0) {
+          alert('请输入有效的广告时长（>0）');
+          return;
+        }
+        
+        if (isNaN(hashThreshold) || hashThreshold < 0.1 || hashThreshold > 1) {
+          alert('请输入有效的图像哈希对比阈值（0.1~1）');
+          return;
+        }
+        
+        if (isNaN(consecutiveFrames) || consecutiveFrames <= 0) {
+          alert('请输入有效的连续对比帧数（>0）');
+          return;
+        }
+        
+        if (isNaN(frameStep) || frameStep <= 0) {
+          alert('请输入有效的帧提取步长（>0）');
+          return;
+        }
+        
+        if (isNaN(timeAdjust)) {
+          alert('请输入有效的时间调整值');
+          return;
+        }
+        
+        requestData.search_window_start = searchWindowStart;
+        requestData.search_window_end = searchWindowEnd;
+        requestData.ad_duration = adDuration;
+        requestData.hash_threshold = hashThreshold;
+        requestData.consecutive_frames = consecutiveFrames;
+        requestData.frame_step = frameStep;  // 添加帧提取步长参数
+        requestData.time_adjust = timeAdjust;  // 添加时间调整参数
+      } else if (mode === 'sample_split') {
+        const hashThreshold = parseFloat(document.getElementById('sample-hash-threshold').value);
+        const consecutiveFrames = parseInt(document.getElementById('sample-consecutive-frames').value);
+        const frameStep = parseFloat(document.getElementById('sample-frame-step').value) || 0.5;
+        const skipInterval = parseFloat(document.getElementById('sample-skip-interval').value) || 30.0;
+        const searchDuration = parseFloat(document.getElementById('sample-search-duration').value) || 10.0;
+        const timeAdjust = parseFloat(document.getElementById('sample-time-adjust').value) || 0.0;
+        
+        if (isNaN(hashThreshold) || hashThreshold < 0.1 || hashThreshold > 1) {
+          alert('请输入有效的图像哈希对比阈值（0.1~1）');
+          return;
+        }
+        
+        if (isNaN(consecutiveFrames) || consecutiveFrames <= 0) {
+          alert('请输入有效的连续对比帧数（>0）');
+          return;
+        }
+        
+        if (isNaN(frameStep) || frameStep <= 0) {
+          alert('请输入有效的帧提取步长（>0）');
+          return;
+        }
+        
+        if (isNaN(skipInterval) || skipInterval <= 0) {
+          alert('请输入有效的跳过间隔（>0）');
+          return;
+        }
+        
+        if (isNaN(searchDuration) || searchDuration <= 0) {
+          alert('请输入有效的搜索持续秒（>0）');
+          return;
+        }
+        
+        if (isNaN(timeAdjust)) {
+          alert('请输入有效的时间调整值');
+          return;
+        }
+        
+        requestData.hash_threshold = hashThreshold;
+        requestData.consecutive_frames = consecutiveFrames;
+        requestData.frame_step = frameStep;
+        requestData.skip_interval = skipInterval;
+        requestData.search_duration = searchDuration;
+        requestData.time_adjust = timeAdjust;
+      } else if (mode === 'watermark_remove') {
+        const watermarkParams = [];
+        const rows = document.querySelectorAll('.watermark-row');
+        let valid = true;
+        
+        rows.forEach((row, index) => {
+          const startInput = row.querySelector('.watermark-start');
+          const endInput = row.querySelector('.watermark-end');
+          const x1Input = row.querySelector('.watermark-x1');
+          const y1Input = row.querySelector('.watermark-y1');
+          const wInput = row.querySelector('.watermark-w');
+          const hInput = row.querySelector('.watermark-h');
+          
+          const start = parseFloat(startInput.value) || 0;
+          const end = endInput.value ? parseFloat(endInput.value) : null;
+          const x1 = parseInt(x1Input.value) || 0;
+          const y1 = parseInt(y1Input.value) || 0;
+          const w = parseInt(wInput.value);
+          const h = parseInt(hInput.value);
+          
+          // 验证结束时间：如果不是最后一条或有值，必须大于开始时间
+          if ((index !== rows.length - 1 || end !== null) && (end === null || end <= start)) {
+            valid = false;
+            return;
+          }
+          
+          if (isNaN(w) || isNaN(h) || w <= 0 || h <= 0) {
+            valid = false;
+            return;
+          }
+          
+          const watermarkParam = {
+            start: start,
+            x1: x1,
+            y1: y1,
+            w: w,
+            h: h
+          };
+          
+          // 只有当结束时间有值时才添加到参数中
+          if (end !== null) {
+            watermarkParam.end = end;
+          }
+          
+          watermarkParams.push(watermarkParam);
+        });
+        
+        if (!valid) {
+          alert('请填写有效的水印参数：\n1. 结束时间必须大于开始时间\n2. 宽度和高度必须大于0\n3. 只有最后一条水印可以不填写结束时间');
+          return;
+        }
+        
+        requestData.watermark_params = watermarkParams;
+      } else {
+        const duration = parseFloat(document.getElementById('duration').value);
+        if (isNaN(duration) || duration <= 0) {
+          alert('请输入有效的裁剪时长（>0）');
+          return;
+        }
+        requestData.duration = duration;
+      }
+
+      document.getElementById('status').textContent = '提交中...';
+      try {
+        const res = await fetch('/api/trim', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(requestData)
+        });
+
+        const data = await res.json();
+        if (data.error) {
+          alert('错误: ' + data.error);
+          document.getElementById('status').textContent = '';
+        } else {
+          document.getElementById('status').textContent = '✅ 已加入队列！';
+          loadOutputVideos();
+        }
+      } catch (e) {
+        alert('请求失败，请确保后端服务正在运行');
+        document.getElementById('status').textContent = '';
+      }
+    }
+
+    // 初始化
+    loadInputVideos();
+    loadOutputVideos();
+    setInterval(loadOutputVideos, 10000);
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "name": "ultraman-m78-rescue",
+  "version": "1.0.0",
+  "private": true,
+  "description": "双人 2D 闯关：赛罗与迪迦拯救 M78",
+  "scripts": {
+    "start": "npx --yes serve . -l 5173"
+  }
+}

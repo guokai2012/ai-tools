@@ -2,7 +2,10 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+  <meta name="theme-color" content="#0f1115">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>txt2tts · Markdown 朗读</title>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
@@ -15,6 +18,7 @@
     <nav class="menu" aria-label="主菜单">
       <a href="#/" class="menu-item" data-route="/">🎧 听文档</a>
       <a href="#/upload" class="menu-item" data-route="/upload">📝 上传转语音</a>
+      <a href="#/settings" class="menu-item" data-route="/settings">⚙️ 系统设置</a>
     </nav>
     <span id="configBadge" class="badge badge-warn" title="MiniMax API key 状态">检查中…</span>
   </header>
@@ -34,97 +38,145 @@
       </div>
     </section>
 
-    <!-- ====================== View: 上传转语音 ====================== -->
+    <!-- ====================== View: 上传转语音（任务列表） ====================== -->
     <section id="view-upload" class="view" hidden>
       <div class="card">
-        <h2>1. 选择文件</h2>
-        <div class="row">
-          <label class="file-picker">
-            <input type="file" id="mdFile" accept=".md,.markdown,.txt">
-            <span class="file-picker-label" id="mdFileLabel">点击选择 .md 文件…</span>
-          </label>
-          <button class="btn btn-ghost" id="loadSampleBtn" type="button">载入示例</button>
+        <div class="row" style="justify-content: space-between;">
+          <h2 style="margin:0;">转语音任务</h2>
+          <button class="btn btn-primary" id="newTaskBtn" type="button">＋ 新增转语音</button>
         </div>
-        <details class="hint">
-          <summary>支持哪些文件？</summary>
-          <p>支持标准 Markdown（.md / .markdown）和纯文本（.txt）。流程：本地清洗（去 md 符号）→ <b>MiniMax M3</b> 标准化（替换 URL/代码/公式、加标点、控字数）→ 小米 MiMo 合成。</p>
-        </details>
-      </div>
-
-      <div class="card">
-        <h2>2. 选择语音</h2>
-        <div class="row">
-          <label class="select-wrap">
-            <span>语音</span>
-            <select id="voiceSelect"></select>
-          </label>
-          <label class="select-wrap narrow">
-            <span>语速 <em id="speedLabel">1.0×</em></span>
-            <input type="range" id="speedRange" min="0.5" max="2.0" step="0.1" value="1.0">
-          </label>
-          <button class="btn btn-ghost" id="refreshVoicesBtn" type="button" title="重新拉取语音列表">↻</button>
+        <p class="hint-inline">上传 MD 文件后，后端会在后台自动完成 <span id="uploadHintSteps">清洗 → M3 标准化 → MiMo TTS 合成</span>。点击「详情」查看当前方案的 6 步进度。</p>
+        <div id="taskList" class="task-list">加载中…</div>
+        <div class="pagination">
+          <button id="taskPrev" class="btn btn-ghost" type="button">‹ 上一页</button>
+          <span id="taskPageInfo" class="meta">第 1 / 1 页</span>
+          <button id="taskNext" class="btn btn-ghost" type="button">下一页 ›</button>
         </div>
-        <p class="hint-inline">默认语音来自后端静态列表；如未配置 API key，会显示一组常见备用语音。</p>
-      </div>
-
-      <div class="card">
-        <h2>3. 预览（M3 标准化后）</h2>
-        <textarea id="cleanedPreview" readonly placeholder="选择文件后，这里会显示经 MiniMax M3 标准化后的可朗读文本…"></textarea>
-        <div class="meta"><span id="textMeta">—</span></div>
-      </div>
-
-      <div class="card">
-        <h2>4. 朗读</h2>
-        <div class="row">
-          <button class="btn btn-primary" id="synthBtn" type="button" disabled>▶ 开始朗读</button>
-          <span id="status" class="status">等待文件…</span>
-        </div>
-
-        <div id="progressWrap" class="progress-wrap" hidden>
-          <div class="step-progress" id="stepProgress">
-            <div class="step" data-stage="markdown_clean">
-              <div class="step-icon">1</div>
-              <div class="step-label">本地清洗</div>
-            </div>
-            <div class="step-bar" data-bar="markdown_clean"></div>
-            <div class="step" data-stage="llm_normalize">
-              <div class="step-icon">2</div>
-              <div class="step-label">M3 标准化</div>
-            </div>
-            <div class="step-bar" data-bar="llm_normalize"></div>
-            <div class="step" data-stage="tts_synthesize">
-              <div class="step-icon">3</div>
-              <div class="step-label">语音合成</div>
-            </div>
-            <div class="step-bar" data-bar="tts_synthesize"></div>
-            <div class="step" data-stage="audio_save">
-              <div class="step-icon">4</div>
-              <div class="step-label">保存落盘</div>
-            </div>
-          </div>
-          <div class="progress-meta">
-            <span id="progressMessage" class="progress-message">准备就绪…</span>
-            <span id="progressPercent" class="progress-percent">0%</span>
-          </div>
-          <div class="progress-bar-track">
-            <div id="progressBarFill" class="progress-bar-fill"></div>
-          </div>
-        </div>
-
-        <audio id="player" controls hidden></audio>
-        <div id="downloadRow" class="row" hidden>
-          <a id="downloadLink" class="btn btn-ghost" href="#" download>下载 MP3</a>
-          <span id="audioMeta" class="meta"></span>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>历史记录（本会话）</h2>
-        <ol id="history" class="history">
-          <li class="hint-inline">最近生成的音频会列在这里（仅本会话，浏览器关闭前有效）。</li>
-        </ol>
       </div>
     </section>
+
+    <!-- ====================== View: 任务详情 ====================== -->
+    <section id="view-task-detail" class="view" hidden>
+      <div class="card">
+        <a href="#/upload" class="btn btn-ghost">‹ 返回任务列表</a>
+        <h2 id="taskDetailTitle">…</h2>
+        <div class="meta"><span id="taskDetailMeta">—</span></div>
+        <div id="taskDetailSteps" class="step-progress"></div>
+        <div class="progress-meta">
+          <span id="taskDetailMessage" class="progress-message">—</span>
+          <span id="taskDetailPercent" class="progress-percent">0%</span>
+        </div>
+        <div class="progress-bar-track">
+          <div id="taskDetailBarFill" class="progress-bar-fill"></div>
+        </div>
+        <div id="taskDetailError" class="task-error" hidden></div>
+        <div id="taskDetailDone" class="task-done" hidden>
+          <a id="taskDetailPlayBtn" href="#" class="btn btn-primary">▶ 去播放</a>
+        </div>
+        <div id="taskDetailRetry" class="task-retry" hidden>
+          <button id="taskDetailRetryBtn" class="btn btn-primary" type="button">↻ 重试任务（从原始 md 重新跑）</button>
+          <span class="hint-inline">原始 md 已自动落盘，可安全重试。</span>
+        </div>
+        <div class="task-danger" style="margin-top:16px; padding-top:12px; border-top:1px dashed var(--border);">
+          <button id="taskDetailDeleteBtn" class="btn btn-ghost btn-danger" type="button">🗑 删除任务</button>
+          <span class="hint-inline" id="taskDetailDeleteHint">删除任务会同时清除中间产物；已成功完成的任务，最终播放文件会保留在 outputs/audio/ 目录。</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ====================== View: 系统设置 ====================== -->
+    <section id="view-settings" class="view" hidden>
+      <div class="card">
+        <h2>系统设置</h2>
+        <p class="hint-inline">选择 MD 转语音的方案。切换后立即对下一次上传生效。</p>
+
+        <div class="settings-row">
+          <div class="setting-block">
+            <label class="setting-label">当前 TTS 方案</label>
+            <div id="settingsCurrentProvider" class="setting-current">—</div>
+          </div>
+        </div>
+
+        <div class="provider-grid">
+          <label class="provider-card" data-provider="mimo">
+            <input type="radio" name="provider" value="mimo" />
+            <div class="provider-card-header">
+              <strong>方案一：M3 + 小米 MiMo</strong>
+              <span class="provider-card-tag">原方案</span>
+            </div>
+            <ul>
+              <li>✅ M3 大模型标准化（含 URL/代码/公式替换）</li>
+              <li>✅ MiMo TTS（需 <code>TTS__API_KEY</code>）</li>
+              <li>✅ 输出 MP3（一次合成，无字幕）</li>
+              <li>❌ 不生成 SRT 字幕</li>
+            </ul>
+          </label>
+
+          <label class="provider-card" data-provider="edge">
+            <input type="radio" name="provider" value="edge" />
+            <div class="provider-card-header">
+              <strong>方案二：M3 + edge-tts + ffmpeg</strong>
+              <span class="provider-card-tag">新方案</span>
+            </div>
+            <ul>
+              <li>✅ M3 语义预处理（多音字[拼音]、拆长句、断句）</li>
+              <li>✅ edge-tts 分段合成（13 个中文 voice）</li>
+              <li>✅ ffmpeg 合并 + 句级 SRT 字幕</li>
+              <li>✅ 自动转换 LRC 歌词（手机播放器可用）</li>
+            </ul>
+          </label>
+        </div>
+
+        <div class="settings-footer">
+          <span id="settingsStatus" class="status">—</span>
+          <div class="row" style="gap:8px;">
+            <button class="btn btn-primary" id="settingsApplyBtn" type="button" disabled>应用更改</button>
+          </div>
+        </div>
+
+        <details class="hint" style="margin-top:18px;">
+          <summary>方案二需要哪些环境依赖？</summary>
+          <ul>
+            <li><code>edge-tts</code>：<code>pip install edge-tts</code></li>
+            <li><code>ffmpeg</code>：项目内置在 <code>bin/ffmpeg.exe</code>；可通过 <code>EDGE__FFMPEG_PATH</code> 自定义</li>
+            <li>Edge voice 配置：<code>EDGE__DEFAULT_VOICE</code>（默认 <code>zh-CN-XiaoxiaoNeural</code>）</li>
+          </ul>
+        </details>
+      </div>
+    </section>
+
+    <!-- ====================== 上传对话框（overlay） ====================== -->
+    <div id="uploadDialog" class="dialog-overlay" hidden>
+      <div class="dialog">
+        <div class="dialog-header">
+          <h3>新增转语音</h3>
+          <button class="btn btn-ghost btn-mini" id="dialogCloseBtn" type="button">✕</button>
+        </div>
+        <div class="dialog-body">
+          <div class="card" style="border:none; box-shadow:none; padding:0;">
+            <label class="file-picker">
+              <input type="file" id="taskFileInput" accept=".md,.markdown,.txt">
+              <span class="file-picker-label" id="taskFileLabel">点击选择 .md 文件…</span>
+            </label>
+          </div>
+          <div class="card" style="border:none; box-shadow:none; padding:0; margin-top:12px;">
+            <label class="select-wrap">
+              <span>语音</span>
+              <select id="taskVoiceSelect"></select>
+            </label>
+          </div>
+        </div>
+        <div class="dialog-footer">
+          <span id="uploadStatus" class="status">选择文件后点击提交</span>
+          <div class="row" style="gap:8px;">
+            <button class="btn btn-ghost" id="dialogCancelBtn" type="button">取消</button>
+            <button class="btn btn-primary" id="dialogSubmitBtn" type="button" disabled>提交任务</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 转歌词功能已移除：原 lyricsDialog 整个删除。LRC 由 edge provider 自动产出，详情页直接渲染。 -->
 
     <!-- ====================== View: 播放详情 ====================== -->
     <section id="view-play" class="view" hidden>
