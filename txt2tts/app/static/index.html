@@ -45,7 +45,7 @@
           <h2 style="margin:0;">转语音任务</h2>
           <button class="btn btn-primary" id="newTaskBtn" type="button">＋ 新增转语音</button>
         </div>
-        <p class="hint-inline">上传 MD 文件后，后端会在后台自动完成 <span id="uploadHintSteps">清洗 → M3 标准化 → MiMo TTS 合成</span>。点击「详情」查看当前方案的 6 步进度。</p>
+        <p class="hint-inline">上传 MD 文件后，后端会在后台自动完成 <span id="uploadHintSteps">M3 标准化 → MiniMax speech-2.8-hd 合成（含 SRT 字幕）</span>。点击「详情」查看当前方案的进度。</p>
         <div id="taskList" class="task-list">加载中…</div>
         <div class="pagination">
           <button id="taskPrev" class="btn btn-ghost" type="button">‹ 上一页</button>
@@ -69,6 +69,10 @@
         <div class="progress-bar-track">
           <div id="taskDetailBarFill" class="progress-bar-fill"></div>
         </div>
+
+        <!-- ====== 分步交互式操作面板（v3 起） ====== -->
+        <div id="taskStepPanel" class="task-step-panel" hidden></div>
+
         <div id="taskDetailError" class="task-error" hidden></div>
         <div id="taskDetailDone" class="task-done" hidden>
           <a id="taskDetailPlayBtn" href="#" class="btn btn-primary">▶ 去播放</a>
@@ -98,17 +102,17 @@
         </div>
 
         <div class="provider-grid">
-          <label class="provider-card" data-provider="mimo">
-            <input type="radio" name="provider" value="mimo" />
+          <label class="provider-card" data-provider="minimax">
+            <input type="radio" name="provider" value="minimax" />
             <div class="provider-card-header">
-              <strong>方案一：M3 + 小米 MiMo</strong>
-              <span class="provider-card-tag">原方案</span>
+              <strong>方案一：M3 + MiniMax speech-2.8-hd</strong>
+              <span class="provider-card-tag">默认 · 含字幕</span>
             </div>
             <ul>
               <li>✅ M3 大模型标准化（含 URL/代码/公式替换）</li>
-              <li>✅ MiMo TTS（需 <code>TTS__API_KEY</code>）</li>
-              <li>✅ 输出 MP3（一次合成，无字幕）</li>
-              <li>❌ 不生成 SRT 字幕</li>
+              <li>✅ MiniMax TTS（与 M3 共用 <code>LLM__API_KEY</code>，留 <code>MINIMAX__API_KEY</code> 可独立设置）</li>
+              <li>✅ 12 个真实 voice_id（含中文男声/女声/英文）</li>
+              <li>✅ 原生 SRT 字幕 + LRC 歌词（subtitle_file 二次 GET）</li>
             </ul>
           </label>
 
@@ -116,7 +120,7 @@
             <input type="radio" name="provider" value="edge" />
             <div class="provider-card-header">
               <strong>方案二：M3 + edge-tts + ffmpeg</strong>
-              <span class="provider-card-tag">新方案</span>
+              <span class="provider-card-tag">备选方案</span>
             </div>
             <ul>
               <li>✅ M3 语义预处理（多音字[拼音]、拆长句、断句）</li>
@@ -176,7 +180,35 @@
       </div>
     </div>
 
-    <!-- 转歌词功能已移除：原 lyricsDialog 整个删除。LRC 由 edge provider 自动产出，详情页直接渲染。 -->
+    <!-- 转歌词功能已移除：原 lyricsDialog 整个删除。LRC 由 minimax / edge provider 自动产出，详情页直接渲染。 -->
+
+    <!-- ====================== 删除任务对话框（v4: 二次确认 / 输入验证） ====================== -->
+    <div id="deleteDialog" class="dialog-overlay" hidden>
+      <div class="dialog">
+        <div class="dialog-header">
+          <h3 id="deleteDialogTitle">确认删除</h3>
+          <button class="btn btn-ghost btn-mini" id="deleteDialogCloseBtn" type="button">✕</button>
+        </div>
+        <div class="dialog-body">
+          <p id="deleteDialogMessage" class="hint-inline"></p>
+          <div id="deleteDialogInputArea" hidden style="margin-top:14px;">
+            <label class="hint-inline" style="font-weight:500;">
+              请输入 <code>确认删除</code> 四个字以继续：
+            </label>
+            <input type="text" id="deleteDialogInput" class="text-input"
+                   placeholder="确认删除" autocomplete="off"
+                   style="margin-top:6px; width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--fg); font-size:14px;">
+          </div>
+        </div>
+        <div class="dialog-footer">
+          <span id="deleteDialogStatus" class="status"></span>
+          <div class="row" style="gap:8px;">
+            <button class="btn btn-ghost" id="deleteDialogCancelBtn" type="button">我再想想</button>
+            <button class="btn btn-primary btn-danger" id="deleteDialogConfirmBtn" type="button" disabled>确认删除</button>
+          </div>
+        </div>
+      </div>
+    </div>
 
     <!-- ====================== View: 播放详情 ====================== -->
     <section id="view-play" class="view" hidden>
@@ -198,10 +230,11 @@
   </main>
 
   <footer class="footer">
-    <span>txt2tts · TTS: <code id="ttsInfo">MiniMax Speech 2.8</code></span>
+    <span>txt2tts · TTS: <code id="ttsInfo">MiniMax speech-2.8-hd</code></span>
     <span><a href="/api/health" target="_blank">/api/health</a> · <a href="/docs" target="_blank">API 文档</a></span>
   </footer>
 
-  <script src="/static/app.js" defer></script>
+  <!-- ?v=8 强制刷新：v6 本地清洗步骤条 + 复选框 + 新面板 -->
+  <script src="/static/app.js?v=8" defer></script>
 </body>
 </html>

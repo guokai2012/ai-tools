@@ -1,22 +1,21 @@
-"""端到端集成测试：edge-tts provider 完整流水线。
+"""v4 端到端集成测试：edge-tts provider 完整流水线。
 
 覆盖：
-  1. LlmNormalizer.semantic_preprocess（含多音字标记 + 句末标点）→ EdgeTtsClient 分段合成 → ffmpeg 合并
-  2. 三件套产物：mp3 / srt / lrc 路径与内容正确
-  3. LibraryStore 写入 provider="edge"（lyrics_path 不再回写，转歌词功能已移除）
-  4. ProgressEvent 携带 provider 字段
+  1. LlmNormalizer.semantic_preprocess → EdgeTtsClient 分段合成 → ffmpeg 合并
+  2. task_dir 下产物：<task_id>.mp3 / <task_id>.SRT / <task_id>.LRC
+  3. ProgressEvent 携带 provider="edge"
 
 注意：
   * EdgeTtsClient.synthesize_segment 被 monkeypatch 为返回"用真实 ffmpeg 生成的 mp3 字节"。
-    这样既不需要联网，又能让 ffprobe 探测到合法时长，触发 ffmpeg concat 合并。
+    既不需联网，又能让 ffprobe 探测到合法时长，触发 ffmpeg concat 合并。
   * LlmNormalizer.semantic_preprocess 被 mock 为返回固定文本，避免真实 M3 调用。
   * 测试用项目的 bin/ffmpeg.exe 与 bin/ffprobe.exe（已内置）。
 """
 from __future__ import annotations
 
 import json
+import re
 import subprocess
-from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -24,15 +23,15 @@ import pytest
 
 from app.config import EdgeTtsSettings, PROVIDER_EDGE
 from app.services.audio_storage import (
-    AudioRecord,
     AudioStorageService,
-    LibraryStore,
-    SettingsStore,
+    TaskRecord,
+    TaskStore,
+    task_date_str,
 )
 from app.services.edge_tts_provider import EdgeTtsClient
 from app.services.llm_normalizer import LlmNormalizer
-from app.services.markdown_service import MarkdownService
 from app.services.pipeline import TtsPipeline
+from app.services.task_manager import TaskManager
 
 
 # ---- helpers --------------------------------------------------------------
@@ -70,14 +69,6 @@ def _ffprobe_duration(path: Path) -> float:
     return float(json.loads(out.stdout)["format"]["duration"])
 
 
-# ---- Fixtures -------------------------------------------------------------
-
-
-class FakeMd:
-    def to_plain_text(self, t: str) -> str:
-        return "行长[zhǎng]得很快。这是一个测试句子。第二句也很短。"
-
-
 # 预设 M3 语义预处理输出（含多音字 [拼音] 标记 + 句末标点）
 SEMANTIC_OUTPUT = (
     "行长[zhǎng]得很快。\n\n"
@@ -86,20 +77,15 @@ SEMANTIC_OUTPUT = (
 )
 
 
-# ---- 测试 -----------------------------------------------------------------
+# ---- 端到端测试 ------------------------------------------------------------
 
 
 async def test_pipeline_edge_full_flow_emits_mp3_srt_lrc(tmp_path: Path):
-    """端到端：上传 .md → edge pipeline → 断言 mp3 + srt + lrc 三件套。"""
-    # ---- 准备 services ----
-    md_svc = FakeMd()
+    """端到端：上传 .md → edge pipeline → 断言 task_dir 下 mp3 + SRT + LRC 三件套。"""
     llm_svc = AsyncMock(spec=LlmNormalizer)
     llm_svc.semantic_preprocess = AsyncMock(return_value=SEMANTIC_OUTPUT)
-    tts_client = AsyncMock()  # edge provider 不调用它，但 pipeline 构造时还是注入
 
     audio_svc = AudioStorageService(tmp_path)
-    library_svc = LibraryStore(tmp_path / "lib.db")
-
     edge_settings = EdgeTtsSettings(
         ffmpeg_path=str(FFMPEG),
         ffprobe_path=str(FFPROBE),
@@ -113,116 +99,80 @@ async def test_pipeline_edge_full_flow_emits_mp3_srt_lrc(tmp_path: Path):
     edge_client = EdgeTtsClient(edge_settings)
 
     # ---- monkeypatch EdgeTtsClient.synthesize_segment ----
-    # 每个 segment 返回一个 0.5s 的真实 mp3 + 单句时间戳
     segment_audio = _make_real_mp3_segment(duration_sec=0.5)
 
     async def fake_synthesize_segment(self, text, *, voice=None):
-        """patch.object 会把方法当 unbound function 调用，第一个位置参数其实是 self。"""
         cues = [(0.0, 0.5, text.strip())]
         return segment_audio, cues
 
-    with patch.object(
-        EdgeTtsClient, "synthesize_segment",
-        new=fake_synthesize_segment,
-    ):
+    with patch.object(EdgeTtsClient, "synthesize_segment", new=fake_synthesize_segment):
         pipe = TtsPipeline(
-            markdown=md_svc,
             llm=llm_svc,
-            tts=tts_client,
             audio=audio_svc,
-            library=library_svc,
-            edge_tts=edge_client,
-            ffmpeg_path=FFMPEG,
-            ffprobe_path=FFPROBE,
-            provider=PROVIDER_EDGE,
+            edge_tts=edge_client, ffmpeg_path=FFMPEG,
+            ffprobe_path=FFPROBE, provider=PROVIDER_EDGE,
         )
 
-        # ---- 收集 ProgressEvent ----
-        events = []
-        async for ev in pipe.run(
-            b"# demo\n\nThis is a test markdown file.",
-            filename="demo.md",
-            voice_id="zh-CN-XiaoxiaoNeural",
-            default_voice_id="zh-CN-XiaoxiaoNeural",
-        ):
-            events.append(ev)
+        # 通过 TaskManager 走完整 create → convert 链路
+        task_store = TaskStore(tmp_path / "lib.db")
+        mgr = TaskManager(
+            pipeline=pipe, task_store=task_store,
+            audio_storage=audio_svc,
+            llm=llm_svc,
+        )
+        task_id = mgr.create_task(b"# demo\n\nThis is a test markdown file.", filename="demo.md")
+        rec = task_store.get(task_id)
+        # 注入 normalized_text（实际 M3 跑过的语义预处理结果）
+        task_store.update_progress(
+            task_id, normalized_text=SEMANTIC_OUTPUT,
+            status="ready_to_convert",
+        )
+        mgr.convert_task(task_id)
+        # 等异步执行完成
+        import asyncio
+        await asyncio.sleep(1.5)
 
-    # ---- 断言 events ----
-    stages = [e.stage for e in events]
-    assert "start" in stages
-    assert "markdown_clean" in stages
-    assert "llm_normalize" in stages
-    assert "tts_synthesize" in stages
-    assert "audio_save" in stages
-    assert "done" in stages
-    assert not any(e.stage == "error" for e in events)
+    rec_after = task_store.get(task_id)
+    assert rec_after.status == "done"
+    date_str = rec_after.date_str
+    task_dir = audio_svc.task_dir(task_id, date_str=date_str)
 
-    done_event = next(e for e in events if e.stage == "done")
-    audio_id = done_event.audio_id
-    assert audio_id, "done event must carry audio_id"
-    # provider 字段
-    assert done_event.provider == "edge"
-    assert all(getattr(e, "provider", None) == "edge" for e in events)
-
-    # ---- 断言 mp3 三件套 ----
-    # 1) AudioStorageService.save 落盘的 mp3
-    saved_mp3 = audio_svc.resolve(audio_id)
-    assert saved_mp3 is not None, f"mp3 not found for {audio_id}"
-    assert saved_mp3.exists()
-    assert saved_mp3.stat().st_size > 0
-    # 必须是合法 mp3（ffprobe 能读时长）
-    mp3_dur = _ffprobe_duration(saved_mp3)
+    # ---- 断言 mp3 / SRT / LRC ----
+    final_mp3 = task_dir / f"{task_id}.mp3"
+    assert final_mp3.exists(), f"mp3 missing: {final_mp3}"
+    mp3_dur = _ffprobe_duration(final_mp3)
     assert mp3_dur > 0.0, "ffprobe should detect non-zero duration"
 
-    # 2) SRT 字幕（v2 写到 audio/_artifacts/<audio_id>/）
-    srt_path = tmp_path / "audio" / "_artifacts" / audio_id / f"{audio_id}.srt"
-    assert srt_path.exists(), f"srt missing: {srt_path}"
-    srt_text = srt_path.read_text(encoding="utf-8")
-    # 至少要有 3 句
-    import re
+    final_srt = task_dir / f"{task_id}.SRT"
+    assert final_srt.exists()
+    srt_text = final_srt.read_text(encoding="utf-8")
     srt_entries = re.findall(r"^\d+$", srt_text, re.MULTILINE)
     assert len(srt_entries) >= 3, f"expected >=3 srt entries, got {len(srt_entries)}"
-    # SRT 时间戳递增
     srt_timestamps = re.findall(
         r"(\d{2}):(\d{2}):(\d{2}),(\d{3})", srt_text,
     )
-    assert len(srt_timestamps) >= 6  # 3 entries × 2 (start, end)
+    assert len(srt_timestamps) >= 6
 
-    # 3) LRC 歌词
-    lrc_path = srt_path.with_suffix(".lrc")
-    assert lrc_path.exists(), f"lrc missing: {lrc_path}"
-    lrc_text = lrc_path.read_text(encoding="utf-8")
-    assert "[ti:demo]" in lrc_text, "LRC header should have title from filename stem"
+    final_lrc = task_dir / f"{task_id}.LRC"
+    assert final_lrc.exists()
+    lrc_text = final_lrc.read_text(encoding="utf-8")
+    # LRC 含 [ti:demo] 头
+    assert f"[ti:{task_id[:8]}]" in lrc_text, "LRC should have title from task_id[:8]"
     assert "[ar:txt2tts]" in lrc_text
-    # 含歌词行（多音字已被剥离）
-    assert "行长[zhǎng]" not in lrc_text, "LRC should strip disambiguation marks"
+    # 歌词行
+    assert "行长[zhǎng]" not in lrc_text
     assert "行长" in lrc_text
     assert "测试句子" in lrc_text
-    # LRC 时间戳格式
     lrc_ts = re.findall(r"\[(\d{2}):(\d{2})\.(\d{2})\]", lrc_text)
-    assert len(lrc_ts) >= 3, f"expected >=3 lrc time tags, got {len(lrc_ts)}"
-
-    # ---- 断言 LibraryStore ----
-    # 转歌词功能已移除：pipeline 不再把 lyrics_path 回写 audio_records。
-    # LibraryStore.lyrics_path 字段保留以兼容旧数据；本任务应当为 None。
-    record = library_svc.get(audio_id)
-    assert record is not None
-    assert record.provider == "edge"
-    assert record.lyrics_path is None
-    assert record.original_filename == "demo.md"
-    # 写入的是 normalized（剥离多音字标记的版本由 pipeline 直接用作为朗读文本，
-    # 但存到库的 normalized_md 保留语义预处理结果）
-    assert "行长" in record.normalized_md
+    assert len(lrc_ts) >= 3
 
 
 async def test_pipeline_edge_segments_dir_cleanup(tmp_path: Path):
-    """端到端跑完后，临时片段目录应该保留（供调试），但完整 mp3 已生成。"""
-    md_svc = FakeMd()
+    """端到端跑完后，task_dir 下 split_<N>.mp3 / <task_id>.mp3 都在；segments/ 不存在（v4 不再单独存）。"""
     llm_svc = AsyncMock(spec=LlmNormalizer)
     llm_svc.semantic_preprocess = AsyncMock(return_value="一句。")
 
     audio_svc = AudioStorageService(tmp_path)
-    library_svc = LibraryStore(tmp_path / "lib.db")
     edge_client = EdgeTtsClient(EdgeTtsSettings(ffmpeg_path=str(FFMPEG)))
 
     segment_audio = _make_real_mp3_segment(duration_sec=0.3)
@@ -232,35 +182,36 @@ async def test_pipeline_edge_segments_dir_cleanup(tmp_path: Path):
 
     with patch.object(EdgeTtsClient, "synthesize_segment", new=fake_segment):
         pipe = TtsPipeline(
-            markdown=md_svc, llm=llm_svc, tts=AsyncMock(),
-            audio=audio_svc, library=library_svc,
+            llm=llm_svc,
+            audio=audio_svc,
             edge_tts=edge_client, ffmpeg_path=FFMPEG,
             ffprobe_path=FFPROBE, provider=PROVIDER_EDGE,
         )
-        events = []
-        async for ev in pipe.run(b"raw md", filename="a.md"):
-            events.append(ev)
+        task_store = TaskStore(tmp_path / "lib.db")
+        mgr = TaskManager(
+            pipeline=pipe, task_store=task_store,
+            audio_storage=audio_svc,
+            llm=llm_svc,
+        )
+        task_id = mgr.create_task(b"# x", filename="a.md")
+        task_store.update_progress(task_id, normalized_text="一句。", status="ready_to_convert")
+        mgr.convert_task(task_id)
+        import asyncio
+        await asyncio.sleep(1.5)
 
-    done = next(e for e in events if e.stage == "done")
-    aid = done.audio_id
-    assert audio_svc.resolve(aid) is not None
-    # 至少存在 segments/<temp_id>/*.mp3 临时片段
-    seg_root = tmp_path / "segments"
-    assert seg_root.exists()
-    seg_dirs = list(seg_root.iterdir())
-    assert seg_dirs, "segments dir should contain at least one task subdir"
-    # 临时 mp3 文件存在
-    found = list(seg_dirs[0].glob("*.mp3"))
-    assert found, "no segment mp3 in temp dir"
+    rec = task_store.get(task_id)
+    task_dir = audio_svc.task_dir(task_id, date_str=rec.date_str)
+    # task_dir 下应有：<task_id>.mp3 + split_<N>.md + split_<N>.mp3 + ...
+    assert (task_dir / f"{task_id}.mp3").exists()
+    # 旧的 segments/ 目录不存在
+    assert not (tmp_path / "segments").exists()
 
 
 async def test_pipeline_edge_provider_field_on_every_event(tmp_path: Path):
     """所有 ProgressEvent 都应携带 provider='edge' 字段（前端识别用）。"""
-    md_svc = FakeMd()
     llm_svc = AsyncMock(spec=LlmNormalizer)
     llm_svc.semantic_preprocess = AsyncMock(return_value="测试句子。")
     audio_svc = AudioStorageService(tmp_path)
-    library_svc = LibraryStore(tmp_path / "lib.db")
     edge_client = EdgeTtsClient(EdgeTtsSettings(ffmpeg_path=str(FFMPEG)))
     seg = _make_real_mp3_segment(duration_sec=0.3)
 
@@ -269,11 +220,12 @@ async def test_pipeline_edge_provider_field_on_every_event(tmp_path: Path):
 
     with patch.object(EdgeTtsClient, "synthesize_segment", new=fake_segment):
         pipe = TtsPipeline(
-            markdown=md_svc, llm=llm_svc, tts=AsyncMock(),
-            audio=audio_svc, library=library_svc,
+            llm=llm_svc,
+            audio=audio_svc,
             edge_tts=edge_client, ffmpeg_path=FFMPEG,
             ffprobe_path=FFPROBE, provider=PROVIDER_EDGE,
         )
+        # 通过 pipeline.run 直接收集 events（不通过 TaskManager）
         events = []
         async for ev in pipe.run(b"# x", filename="x.md"):
             events.append(ev)
@@ -286,20 +238,16 @@ async def test_pipeline_edge_provider_field_on_every_event(tmp_path: Path):
 
 async def test_pipeline_edge_handles_semantic_preprocess_failure(tmp_path: Path):
     """M3 语义预处理失败时，pipeline 应当 yield error event 而不抛异常。"""
-    md_svc = FakeMd()
     llm_svc = AsyncMock(spec=LlmNormalizer)
     from app.services.llm_normalizer import LlmNormalizationError
-    llm_svc.semantic_preprocess = AsyncMock(
-        side_effect=LlmNormalizationError("m3 down"),
-    )
+    llm_svc.semantic_preprocess = AsyncMock(side_effect=LlmNormalizationError("m3 down"))
 
     audio_svc = AudioStorageService(tmp_path)
-    library_svc = LibraryStore(tmp_path / "lib.db")
     edge_client = EdgeTtsClient(EdgeTtsSettings(ffmpeg_path=str(FFMPEG)))
 
     pipe = TtsPipeline(
-        markdown=md_svc, llm=llm_svc, tts=AsyncMock(),
-        audio=audio_svc, library=library_svc,
+        llm=llm_svc,
+        audio=audio_svc,
         edge_tts=edge_client, ffmpeg_path=FFMPEG,
         ffprobe_path=FFPROBE, provider=PROVIDER_EDGE,
     )
@@ -311,6 +259,6 @@ async def test_pipeline_edge_handles_semantic_preprocess_failure(tmp_path: Path)
     error_events = [e for e in events if e.stage == "error"]
     assert len(error_events) == 1
     assert "m3 down" in error_events[0].error
-    # 不应产生 mp3 / srt / lrc（pipeline 提早失败 → 没机会落盘）
-    assert not (tmp_path / "audio").exists() or \
-        not list((tmp_path / "audio" / "_artifacts").rglob("*.lrc"))
+    # 不应产生 mp3（pipeline 提早失败）
+    assert not (tmp_path / "audio").exists()
+    assert not list(tmp_path.rglob("*.mp3"))

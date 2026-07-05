@@ -1,41 +1,64 @@
-"""HTTP routes for the txt2tts service.
+"""HTTP routes for the txt2tts service (v6: 加本地清洗步骤).
 
-任务模式 API:
-    POST /api/tasks             -> 创建后台 TTS 转语音任务
-    GET  /api/tasks             -> 分页列出任务
-    GET  /api/tasks/{task_id}   -> 查询单条任务进度
-    POST /api/preview           -> run M3 normalization, return JSON (no audio)
+任务模式 API（分步交互式 v6）：
+    POST   /api/tasks                         -> 创建草稿任务（写 task_dir/<task_id>.md）
+    GET    /api/tasks                         -> 分页列出任务
+    GET    /api/tasks/{task_id}               -> 查询单条任务详情
+    POST   /api/tasks/{task_id}/normalize     -> 触发 M3 标准化（写 task_dir/normalization.md）
+    POST   /api/tasks/{task_id}/skip-normalize-> 跳过标准化（复制 <task_id>.md → normalization.md）
+    POST   /api/tasks/{task_id}/split         -> 触发 M3 拆分（写 task_dir/split_<N>.md）
+    POST   /api/tasks/{task_id}/confirm-split -> 确认子文档
+    POST   /api/tasks/{task_id}/skip-split    -> 跳过拆分（复制 normalization.md → split_1.md）
+    POST   /api/tasks/{task_id}/local-clean   -> v6 本地清洗（覆写 split_<N>.md）
+    POST   /api/tasks/{task_id}/skip-local-clean -> v6 跳过本地清洗
+    POST   /api/tasks/{task_id}/convert       -> 启动 TTS 转换（写 task_dir/{split,final} 产物）
+    POST   /api/tasks/{task_id}/retry         -> 阶段感知重试
+    DELETE /api/tasks/{task_id}               -> 删除任务（rmtree task_dir + 删 tasks 行）
+    GET    /api/split-presets                 -> 内置拆分提示词
+    GET    /api/normalize-presets             -> v6 内置标准化提示词
+    GET    /api/clean-options                 -> v6 本地清洗项元数据
+    POST   /api/preview                       -> run M3 normalization, return JSON (no audio)
 
 其他端点:
     GET  /api/voices             -> selectable voice list
-    GET  /api/audio/{audio_id}   -> stream a stored mp3 (Range supported)
+    GET  /api/audio/{task_id}    -> stream task_dir/<yyyymmdd>/<task_id>/<task_id>.mp3
     GET  /api/health             -> liveness + key configuration status
     GET  /api/storage/stats      -> outputs/ size info
-    GET  /api/library            -> 分页列出已完成的语音（听文档）
-    GET  /api/library/{audio_id} -> 查询单条语音详情
+    GET  /api/library            -> status='done' 任务列表（听文档）
+    GET  /api/library/{task_id}  -> 单条任务详情（task_dir 文件系统拼装）
+    GET  /api/lyrics/{task_id}.lrc -> 读 task_dir/<task_id>.LRC
 """
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 from app.config import (
     AppSettings,
+    NORMALIZE_PRESETS,
     PROVIDERS,
+    SPLIT_PRESETS,
     get_edge_voices,
-    get_mimo_voices,
+    get_m3_system_prompt,
+    get_minimax_voices,
     get_settings,
 )
 from app.models.schemas import (
-    AudioDetailDto,
-    AudioRecordDto,
+    CleanOptionDto,
+    ConfirmSplitRequest,
+    LibraryDetailDto,
+    LibraryItemDto,
     LibraryPageDto,
+    LocalCleanRequest,
+    NormalizeRequest,
     SettingsDto,
     SettingsUpdateDto,
+    SplitPresetDto,
+    SplitRequest,
     TaskCreateResponseDto,
     TaskDeleteResponseDto,
     TaskListDto,
@@ -44,16 +67,16 @@ from app.models.schemas import (
     VoicesResponse,
 )
 from app.services.audio_storage import (
+    TASK_RETRYABLE_STATUSES,
+    TASK_STATUS_DONE,
     AudioStorageService,
-    LibraryStore,
     SettingsStore,
     TaskStore,
 )
 from app.services.llm_normalizer import LlmNormalizationError, LlmNormalizer
-from app.services.markdown_service import MarkdownService
 from app.services.pipeline import TtsPipeline
 from app.services.task_manager import TaskManager
-from app.services.tts_client import TtsApiError, TtsClient
+from app.services.text_cleaner import get_clean_options as _get_clean_options
 
 logger = logging.getLogger(__name__)
 
@@ -61,14 +84,11 @@ router = APIRouter(prefix="/api", tags=["tts"])
 
 # ---- shared service singletons (injected at startup) ----------------------
 
-_markdown_svc: Optional[MarkdownService] = None
 _llm_normalizer: Optional[LlmNormalizer] = None
-_tts_client: Optional[TtsClient] = None
 _audio_storage: Optional[AudioStorageService] = None
-_library: Optional[LibraryStore] = None
 _pipeline: Optional[TtsPipeline] = None
-_pipelines: dict = {}                # {"mimo": Pipeline, "edge": Pipeline}
-_active_provider: str = "mimo"
+_pipelines: dict = {}                # {"minimax": Pipeline, "edge": Pipeline}
+_active_provider: str = "minimax"
 _task_store: Optional[TaskStore] = None
 _task_manager: Optional[TaskManager] = None
 _settings_store: Optional[SettingsStore] = None
@@ -76,61 +96,50 @@ _settings_store: Optional[SettingsStore] = None
 
 def configure(
     *,
-    markdown: MarkdownService,
     llm: LlmNormalizer,
-    tts: TtsClient,
     audio: AudioStorageService,
-    library: LibraryStore,
     task_store: Optional[TaskStore] = None,
     settings_store: Optional[SettingsStore] = None,
     pipelines: Optional[dict] = None,
-    active_provider: str = "mimo",
+    active_provider: str = "minimax",
 ) -> None:
     """Inject the shared service instances. Called once from main.py."""
-    global _markdown_svc, _llm_normalizer, _tts_client, _audio_storage, _library
+    global _llm_normalizer, _audio_storage
     global _pipeline, _pipelines, _active_provider
     global _task_store, _task_manager, _settings_store
-    _markdown_svc = markdown
     _llm_normalizer = llm
-    _tts_client = tts
     _audio_storage = audio
-    _library = library
     if pipelines:
         _pipelines = pipelines
-        # 兼容老单 Pipeline 调用方：选 active 那条作为 _pipeline
-        _pipeline = pipelines.get(active_provider) or pipelines.get("mimo")
+        _pipeline = pipelines.get(active_provider) or pipelines.get("minimax")
     else:
-        _pipeline = TtsPipeline(markdown=markdown, llm=llm, tts=tts, audio=audio, library=library)
-        _pipelines = {"mimo": _pipeline}
+        _pipeline = None
+        _pipelines = {}
     _active_provider = active_provider
     _task_store = task_store
-    if task_store is not None:
-        # 默认 uploads_dir 占位；create_task 路由会在收到上传时覆盖
+    if task_store is not None and _pipeline is not None:
         _task_manager = TaskManager(
             pipeline=_pipeline, task_store=task_store,
-            uploads_dir=Path.cwd() / "uploads",
+            audio_storage=audio,
+            llm=llm,
         )
     _settings_store = settings_store
 
 
 def _active_pipeline() -> TtsPipeline:
-    """根据运行时 active provider 返回当前 Pipeline；切换 provider 时 TaskManager 也要重建。"""
     global _task_manager, _pipeline
     pipe = _pipelines.get(_active_provider)
     if pipe is None:
-        # 兜底：返回 mimo
-        pipe = _pipelines.get("mimo")
+        pipe = _pipelines.get("minimax")
     if pipe is None:
         raise HTTPException(status_code=503, detail="No pipeline available")
-    # TaskManager 用最新 active pipeline
     if _task_manager is not None and _task_manager._pipeline is not pipe:
-        _task_manager._pipeline = pipe  # type: ignore[attr-defined]
+        _task_manager._pipeline = pipe
     _pipeline = pipe
     return pipe
 
 
 def _set_active_provider(provider: str) -> None:
-    """运行时切换 provider（写入 SettingsStore，更新 _active_provider）。"""
     global _active_provider
     if provider not in PROVIDERS:
         raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
@@ -139,10 +148,16 @@ def _set_active_provider(provider: str) -> None:
         _settings_store.set("tts_provider", provider)
 
 
-def _require_md() -> MarkdownService:
-    if _markdown_svc is None:
-        raise HTTPException(status_code=503, detail="MarkdownService not initialized")
-    return _markdown_svc
+def _require_md_removed() -> None:
+    """v5 起本地 Markdown 清洗已删除。
+
+    旧路由（preview）原本依赖 MarkdownService，现保留路径但返回 410 提示用户
+    删除入口。如需保留 preview 行为可直接调 normalize —— 不走本地清洗版本。
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="本地 Markdown 清洗已废弃（v5 起原始 MD 直接送 M3）。",
+    )
 
 
 def _require_llm() -> LlmNormalizer:
@@ -161,12 +176,6 @@ def _require_audio() -> AudioStorageService:
     if _audio_storage is None:
         raise HTTPException(status_code=503, detail="AudioStorageService not initialized")
     return _audio_storage
-
-
-def _require_library() -> LibraryStore:
-    if _library is None:
-        raise HTTPException(status_code=503, detail="LibraryStore not initialized")
-    return _library
 
 
 def _require_task_store() -> TaskStore:
@@ -195,9 +204,9 @@ async def health(settings: AppSettings = Depends(get_settings)) -> dict:
     return {
         "status": "ok",
         "app": settings.app_name,
-        "tts_configured": bool(settings.tts.api_key),
-        "tts_model": settings.tts.model,
-        "tts_base_url": settings.tts.base_url,
+        "tts_configured": bool(settings.minimax.api_key or settings.llm.api_key),
+        "tts_model": settings.minimax.model,
+        "tts_base_url": settings.minimax.base_url,
         "llm_configured": bool(settings.llm.api_key),
         "llm_model": settings.llm.model,
         "llm_base_url": settings.llm.base_url,
@@ -206,7 +215,6 @@ async def health(settings: AppSettings = Depends(get_settings)) -> dict:
 
 @router.get("/voices", response_model=VoicesResponse)
 async def voices(settings: AppSettings = Depends(get_settings)) -> VoicesResponse:
-    # 当前 provider 是 edge 时优先返回 Edge voices；否则返回 MiMo 静态 voice
     if _active_provider == "edge":
         return VoicesResponse(
             voices=[VoiceDto(id=v["id"], name=v["name"], lang=v.get("lang"))
@@ -215,7 +223,7 @@ async def voices(settings: AppSettings = Depends(get_settings)) -> VoicesRespons
         )
     return VoicesResponse(
         voices=[VoiceDto(id=v["id"], name=v["name"], lang=v.get("lang"))
-                for v in get_mimo_voices()],
+                for v in get_minimax_voices()],
         source="static",
     )
 
@@ -225,40 +233,37 @@ async def preview_markdown(
     file: UploadFile = File(...),
     settings: AppSettings = Depends(get_settings),
 ) -> JSONResponse:
-    """Run local Markdown cleanup + M3 normalization and return both."""
-    md_svc = _require_md()
+    """v5 起：本地 Markdown 清洗已废弃 —— 直接把原文 MD 送 M3 标准化。
+
+    兼容旧 UI 字段（仍返回 local_clean 关键字，但内容 = 原文），不再做
+    二次正则清洗；M3 自己负责处理 markdown 残留。
+    """
     llm = _require_llm()
 
     raw = await file.read()
     if len(raw) > settings.max_md_size_kb * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large (>{settings.max_md_size_kb} KB).",
-        )
+        raise HTTPException(status_code=413, detail=f"File too large (>{settings.max_md_size_kb} KB).")
     try:
         markdown_text = raw.decode("utf-8")
     except UnicodeDecodeError:
         markdown_text = raw.decode("gbk", errors="ignore")
 
-    local_clean = md_svc.to_plain_text(markdown_text)
-    if not local_clean.strip():
+    if not markdown_text.strip():
         raise HTTPException(status_code=422, detail="Markdown file has no readable text.")
 
     try:
-        normalized = await llm.normalize(local_clean)
+        normalized = await llm.normalize(markdown_text)
     except LlmNormalizationError as exc:
         logger.exception("M3 normalization failed during preview")
         raise HTTPException(status_code=502, detail=f"M3 normalization failed: {exc}")
 
     if len(normalized) > settings.max_normalized_chars:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Normalized text too long ({len(normalized)} > {settings.max_normalized_chars}).",
-        )
+        raise HTTPException(status_code=413, detail=f"Normalized text too long.")
 
     return JSONResponse({
         "filename": file.filename,
-        "local_clean": local_clean,
+        # v5 起 local_clean 字段保留为原文（向后兼容旧前端），不再清洗
+        "local_clean": markdown_text,
         "normalized": normalized,
         "length": len(normalized),
         "source": "llm",
@@ -271,33 +276,27 @@ async def create_task(
     voice_id: Optional[str] = Form(default=None),
     settings: AppSettings = Depends(get_settings),
 ) -> TaskCreateResponseDto:
-    """上传 MD 文件并创建后台 TTS 转语音任务，返回 task_id 供前端轮询。"""
-    # 校验上传文件
+    """上传 MD 文件并创建后台 TTS 转语音任务，返回 task_id 供前端轮询。
+
+    v5 起：原文 MD 直接落盘 + 入库 draft（不再做本地清洗）。
+    """
     filename = file.filename or "uploaded.md"
     lower = filename.lower()
     if not (lower.endswith(".md") or lower.endswith(".markdown") or lower.endswith(".txt")):
         raise HTTPException(status_code=400, detail="Only .md/.markdown/.txt files are supported.")
     raw = await file.read()
     if len(raw) > settings.max_md_size_kb * 1024:
-        raise HTTPException(
-            status_code=413, detail=f"File too large (>{settings.max_md_size_kb} KB)."
-        )
+        raise HTTPException(status_code=413, detail=f"File too large (>{settings.max_md_size_kb} KB).")
 
-    # 根据当前 active provider 选对应 pipeline
     if _task_store is None:
         raise HTTPException(status_code=503, detail="TaskStore not initialized")
     pipe = _active_pipeline()
-    # 解析 uploads_dir = output_dir / uploads/（与 TaskManager 内部路径一致）
-    from pathlib import Path as _Path
-    uploads_dir = _Path(settings.output_dir).resolve() / "uploads"
     mgr = TaskManager(
         pipeline=pipe,
         task_store=_task_store,
-        uploads_dir=uploads_dir,
         audio_storage=_require_audio(),
-        library=_require_library(),
+        llm=_require_llm(),
     )
-    # 缓存为全局，避免每次重建
     global _task_manager
     _task_manager = mgr
 
@@ -305,115 +304,241 @@ async def create_task(
         raw,
         filename=filename,
         voice_id=voice_id,
-        default_voice_id=settings.tts.voice,
+        default_voice_id=settings.minimax.voice_id,
     )
-    return TaskCreateResponseDto(task_id=task_id, message="任务已创建")
+    return TaskCreateResponseDto(task_id=task_id, message="草稿任务已创建")
 
 
 @router.post("/tasks/{task_id}/retry", response_model=TaskCreateResponseDto)
 async def retry_task(task_id: str) -> TaskCreateResponseDto:
-    """重试一个 failed / failed_retryable 任务。
-
-    重新从 ``outputs/uploads/<task_id>.md`` 读出原始文件，走当前 active provider
-    的 pipeline 全流程。retry_count 递增，error 列清空。
-    """
+    """阶段感知重试（v4）。"""
     mgr = _require_task_manager()
     ok = mgr.retry_task(task_id)
     if not ok:
         record = _task_store.get(task_id) if _task_store else None
         if record is None:
             raise HTTPException(status_code=404, detail="Task not found.")
-        if record.status not in ("failed_retryable", "error"):
+        if record.status not in TASK_RETRYABLE_STATUSES:
             raise HTTPException(
                 status_code=409,
                 detail=f"Task status={record.status!r} is not retryable.",
             )
         raise HTTPException(
             status_code=410,
-            detail="原始 md 文件已丢失，无法重试。",
+            detail="任务记录缺少必要字段或原始 md 已丢失，无法重试。",
         )
     return TaskCreateResponseDto(task_id=task_id, message="已触发重试")
 
 
+# ---- 分步交互流程端点 ---------------------------------------------------
+
+
+@router.post("/tasks/{task_id}/normalize", response_model=TaskCreateResponseDto)
+async def normalize_task(
+    task_id: str,
+    body: Optional[NormalizeRequest] = None,
+) -> TaskCreateResponseDto:
+    mgr = _require_task_manager()
+    # body.prompt 为空字符串 / None → 用 get_m3_system_prompt() 默认值
+    prompt = body.prompt if body and body.prompt and body.prompt.strip() else None
+    ok = mgr.normalize_task(task_id, system_prompt=prompt)
+    if not ok:
+        record = _task_store.get(task_id) if _task_store else None
+        if record is None:
+            raise HTTPException(status_code=404, detail="Task not found.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task status={record.status!r}（仅 draft 可标准化）",
+        )
+    return TaskCreateResponseDto(task_id=task_id, message="M3 标准化已启动")
+
+
+@router.post("/tasks/{task_id}/skip-normalize", response_model=TaskCreateResponseDto)
+async def skip_normalize_task(task_id: str) -> TaskCreateResponseDto:
+    mgr = _require_task_manager()
+    ok = mgr.skip_normalize(task_id)
+    if not ok:
+        record = _task_store.get(task_id) if _task_store else None
+        if record is None:
+            raise HTTPException(status_code=404, detail="Task not found.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task status={record.status!r}（仅 draft 可跳过标准化）",
+        )
+    return TaskCreateResponseDto(task_id=task_id, message="已跳过标准化")
+
+
+@router.post("/tasks/{task_id}/split", response_model=TaskCreateResponseDto)
+async def split_task(task_id: str, body: SplitRequest) -> TaskCreateResponseDto:
+    mgr = _require_task_manager()
+    ok = mgr.split_task(task_id, body.prompt)
+    if not ok:
+        record = _task_store.get(task_id) if _task_store else None
+        if record is None:
+            raise HTTPException(status_code=404, detail="Task not found.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task status={record.status!r}（仅 ready_to_split / splitted 可拆分）",
+        )
+    return TaskCreateResponseDto(task_id=task_id, message="M3 拆分已启动")
+
+
+@router.post("/tasks/{task_id}/confirm-split", response_model=TaskCreateResponseDto)
+async def confirm_split_task(
+    task_id: str,
+    body: ConfirmSplitRequest = ConfirmSplitRequest(),
+) -> TaskCreateResponseDto:
+    mgr = _require_task_manager()
+    ok = mgr.confirm_split(task_id, body.chunks)
+    if not ok:
+        record = _task_store.get(task_id) if _task_store else None
+        if record is None:
+            raise HTTPException(status_code=404, detail="Task not found.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task status={record.status!r}（仅 splitted 可确认）",
+        )
+    return TaskCreateResponseDto(task_id=task_id, message="子文档已确认")
+
+
+@router.post("/tasks/{task_id}/skip-split", response_model=TaskCreateResponseDto)
+async def skip_split_task(task_id: str) -> TaskCreateResponseDto:
+    mgr = _require_task_manager()
+    ok = mgr.skip_split(task_id)
+    if not ok:
+        record = _task_store.get(task_id) if _task_store else None
+        if record is None:
+            raise HTTPException(status_code=404, detail="Task not found.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task status={record.status!r}（仅 ready_to_split / splitted 可跳过拆分）",
+        )
+    return TaskCreateResponseDto(task_id=task_id, message="已跳过拆分")
+
+
+# ---- 本地清洗（v6 新增） -------------------------------------------------
+
+
+@router.post("/tasks/{task_id}/local-clean", response_model=TaskCreateResponseDto)
+async def local_clean_task(
+    task_id: str,
+    body: LocalCleanRequest = LocalCleanRequest(),
+) -> TaskCreateResponseDto:
+    """splitted → local_cleaning → local_cleaned。
+
+    异步对每个 chunk 应用 ``apply_local_clean``，覆写 ``split_<N>.md``。
+    """
+    mgr = _require_task_manager()
+    ok = mgr.local_clean_task(task_id, body.options)
+    if not ok:
+        record = _task_store.get(task_id) if _task_store else None
+        if record is None:
+            raise HTTPException(status_code=404, detail="Task not found.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task status={record.status!r}（仅 splitted 可本地清洗）",
+        )
+    return TaskCreateResponseDto(task_id=task_id, message="本地清洗已启动")
+
+
+@router.post("/tasks/{task_id}/skip-local-clean", response_model=TaskCreateResponseDto)
+async def skip_local_clean_task(task_id: str) -> TaskCreateResponseDto:
+    """splitted → ready_to_convert，clean_options 留空。"""
+    mgr = _require_task_manager()
+    ok = mgr.skip_local_clean(task_id)
+    if not ok:
+        record = _task_store.get(task_id) if _task_store else None
+        if record is None:
+            raise HTTPException(status_code=404, detail="Task not found.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task status={record.status!r}（仅 splitted 可跳过本地清洗）",
+        )
+    return TaskCreateResponseDto(task_id=task_id, message="已跳过本地清洗")
+
+
+@router.get("/clean-options", response_model=List[CleanOptionDto])
+async def list_clean_options() -> List[CleanOptionDto]:
+    """返回本地清洗项元数据（前端复选框渲染用）。"""
+    return [
+        CleanOptionDto(
+            id=opt["id"],  # type: ignore[arg-type]
+            label=opt["label"],  # type: ignore[arg-type]
+            default=bool(opt.get("default", False)),
+            description=opt.get("description"),  # type: ignore[arg-type]
+        )
+        for opt in _get_clean_options()
+    ]
+
+
+@router.post("/tasks/{task_id}/convert", response_model=TaskCreateResponseDto)
+async def convert_task(task_id: str) -> TaskCreateResponseDto:
+    mgr = _require_task_manager()
+    ok = mgr.convert_task(task_id)
+    if not ok:
+        record = _task_store.get(task_id) if _task_store else None
+        if record is None:
+            raise HTTPException(status_code=404, detail="Task not found.")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task status={record.status!r}（仅 ready_to_convert 可启动转换）",
+        )
+    return TaskCreateResponseDto(task_id=task_id, message="TTS 转换已启动")
+
+
+@router.get("/split-presets", response_model=List[SplitPresetDto])
+async def list_split_presets() -> List[SplitPresetDto]:
+    return [
+        SplitPresetDto(id=p["id"], name=p["name"], prompt=p["prompt"])
+        for p in SPLIT_PRESETS
+    ]
+
+
+@router.get("/normalize-presets", response_model=List[SplitPresetDto])
+async def list_normalize_presets() -> List[SplitPresetDto]:
+    """v6 起：标准化提示词预设列表（与拆分同形态）。
+
+    ``default`` preset 的 prompt=None，会 fallback 到当前 get_m3_system_prompt() 值。
+    """
+    out: List[SplitPresetDto] = []
+    for p in NORMALIZE_PRESETS:
+        prompt_text = p["prompt"] if p["prompt"] is not None else get_m3_system_prompt()
+        out.append(SplitPresetDto(id=p["id"], name=p["name"], prompt=prompt_text))
+    return out
+
+
 @router.delete("/tasks/{task_id}", response_model=TaskDeleteResponseDto)
 async def delete_task(task_id: str) -> TaskDeleteResponseDto:
-    """删除一个任务及其派生文件。
+    """删除任务：rmtree task_dir + 删 tasks 行。
 
-    行为：
-        * ``status='done'`` 的任务会**保留**最终播放所需的
-          ``outputs/audio/<audio_id>.mp3`` 与 ``outputs/audio/_artifacts/<audio_id>/``
-          （包括 normalized.md / 子段 mp3 / srt / lrc / 原始 md），
-          仅删除任务元数据 + 中间目录（uploads/chunks/segments）+ 听文档表行。
-        * 其它状态（pending/processing/error/failed_retryable）的任务会**彻底**删除
-          所有派生文件、库行、任务行。
-
-    返回删除摘要（removed_files 各分类计数 + kept_final_audio 标志）。
+    前端会弹"确认删除"对话框：done 状态需输入"确认删除"四个字，其他状态二次确认。
     """
     mgr = _require_task_manager()
     if _task_store is None:
         raise HTTPException(status_code=503, detail="TaskStore not initialized")
-    # 如果 lifespan 装的 manager 没带 audio_storage/library（兼容旧单测 wiring），
-    # 这里补上，DELETE 完整清理需要这两个依赖。
-    if mgr._audio_storage is None or mgr._library is None:
-        from pathlib import Path as _Path
-        settings = get_settings()
-        uploads_dir = _Path(settings.output_dir).resolve() / "uploads"
-        mgr = TaskManager(
-            pipeline=mgr._pipeline,
-            task_store=_task_store,
-            uploads_dir=uploads_dir,
-            audio_storage=_require_audio(),
-            library=_require_library(),
-        )
+    # v4：TaskManager 内部已经持有 audio_storage；DELETE 直接走 mgr.delete_task
     result = mgr.delete_task(task_id)
     if not result.get("found"):
         raise HTTPException(status_code=404, detail="Task not found.")
     return TaskDeleteResponseDto(**result)
 
 
-@router.get("/tasks", response_model=TaskListDto)
-async def list_tasks(
-    page: int = 1,
-    size: int = 20,
-) -> TaskListDto:
-    """分页列出后台转语音任务，按时间倒序。"""
-    store = _require_task_store()
-    page = max(1, page)
-    size = max(1, min(size, 100))
-    items, total = store.list_page(page=page, size=size)
-    return TaskListDto(
-        items=[
-            TaskRecordDto(
-                task_id=r.task_id,
-                filename=r.filename,
-                voice_id=r.voice_id,
-                status=r.status,
-                current_stage=r.current_stage,
-                progress=r.progress,
-                message=r.message,
-                audio_id=r.audio_id,
-                error=r.error,
-                created_at=r.created_at,
-                updated_at=r.updated_at,
-                retry_count=r.retry_count,
-                can_retry=(r.status == "failed_retryable"),
-                provider=r.provider,
-            )
-            for r in items
-        ],
-        page=page,
-        size=size,
-        total=total,
-    )
-
-
-@router.get("/tasks/{task_id}", response_model=TaskRecordDto)
-async def get_task(task_id: str) -> TaskRecordDto:
-    """查询单条任务进度详情。"""
-    store = _require_task_store()
-    record = store.get(task_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Task not found.")
+def _to_task_dto(record, *, include_text: bool = False) -> TaskRecordDto:
+    """把 TaskRecord 转成 TaskRecordDto；include_text=True 时附带大文本字段（仅 detail API）。"""
+    import json as _json
+    chunks: Optional[List[str]] = None
+    if include_text and record.split_chunks:
+        try:
+            chunks = _json.loads(record.split_chunks)
+        except _json.JSONDecodeError:
+            chunks = None
+    clean_opts: Optional[List[str]] = None
+    if record.clean_options:
+        try:
+            clean_opts = _json.loads(record.clean_options)
+        except _json.JSONDecodeError:
+            clean_opts = None
+    can_retry = record.status in TASK_RETRYABLE_STATUSES
     return TaskRecordDto(
         task_id=record.task_id,
         filename=record.filename,
@@ -422,26 +547,59 @@ async def get_task(task_id: str) -> TaskRecordDto:
         current_stage=record.current_stage,
         progress=record.progress,
         message=record.message,
-        audio_id=record.audio_id,
         error=record.error,
+        date_str=record.date_str,
         created_at=record.created_at,
         updated_at=record.updated_at,
         retry_count=record.retry_count,
-        can_retry=(record.status == "failed_retryable"),
+        can_retry=can_retry,
         provider=record.provider,
+        local_clean_length=len(record.local_clean_text) if record.local_clean_text else None,
+        # v6：draft 时返回原文（前端"查看原本"前 300 字预览用）；其他状态为 None
+        local_clean_text=record.local_clean_text if record.status == "draft" else None,
+        normalized_length=len(record.normalized_text) if record.normalized_text else None,
+        normalized_text=record.normalized_text if include_text else None,
+        split_prompt=record.split_prompt if include_text else None,
+        split_chunks=chunks,
+        # v6：splitted / local_cleaned 时返回勾选清洗项（前端面板回显用）
+        clean_options=clean_opts if include_text else None,
     )
 
 
-@router.get("/audio/{audio_id}")
-async def get_audio(audio_id: str) -> FileResponse:
+@router.get("/tasks", response_model=TaskListDto)
+async def list_tasks(page: int = 1, size: int = 20) -> TaskListDto:
+    store = _require_task_store()
+    page = max(1, page)
+    size = max(1, min(size, 100))
+    items, total = store.list_page(page=page, size=size)
+    return TaskListDto(
+        items=[_to_task_dto(r, include_text=False) for r in items],
+        page=page, size=size, total=total,
+    )
+
+
+@router.get("/tasks/{task_id}", response_model=TaskRecordDto)
+async def get_task(task_id: str) -> TaskRecordDto:
+    store = _require_task_store()
+    record = store.get(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    return _to_task_dto(record, include_text=True)
+
+
+@router.get("/audio/{task_id}")
+async def get_audio(task_id: str) -> FileResponse:
+    """流式播放 task_dir/<yyyymmdd>/<task_id>/<task_id>.mp3。"""
     audio_svc = _require_audio()
-    path = audio_svc.resolve(audio_id)
+    task_store = _require_task_store()
+    record = task_store.get(task_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    path = audio_svc.resolve(task_id, date_str=record.date_str or None)
     if path is None:
         raise HTTPException(status_code=404, detail="Audio not found.")
     return FileResponse(
-        path,
-        media_type="audio/mpeg",
-        filename=f"{audio_id}.mp3",
+        path, media_type="audio/mpeg", filename=f"{task_id}.mp3",
         headers={"Cache-Control": "no-cache"},
     )
 
@@ -451,86 +609,98 @@ async def storage_stats() -> dict:
     return _require_audio().stats()
 
 
-# ---- Library (听文档) ---------------------------------------------------
+# ---- Library (听文档) — 直接读 tasks 表 status='done' -------------------
 
 
 @router.get("/library", response_model=LibraryPageDto)
-async def list_library(
-    page: int = 1,
-    size: int = 10,
-) -> LibraryPageDto:
-    """Paginated list of successfully synthesized audios, newest first."""
-    library = _require_library()
+async def list_library(page: int = 1, size: int = 10) -> LibraryPageDto:
+    store = _require_task_store()
     page = max(1, page)
-    size = max(1, min(size, 100))  # cap page size
-    items, total = library.list_page(page=page, size=size)
-    return LibraryPageDto(
-        items=[
-            AudioRecordDto(
-                audio_id=r.audio_id,
-                original_filename=r.original_filename,
-                voice_id=r.voice_id,
-                duration_sec=r.duration_sec,
-                byte_size=r.byte_size,
-                created_at=r.created_at,
-                has_lyrics=bool(r.lyrics_path),
-                provider=r.provider or "mimo",
-            )
-            for r in items
-        ],
-        page=page,
-        size=size,
-        total=total,
-    )
+    size = max(1, min(size, 100))
+    items, total = store.list_done(page=page, size=size)
+    audio_svc = _require_audio()
+    library_items = []
+    for r in items:
+        # 解析 <task_id>.mp3 文件大小 + LRC 是否存在
+        mp3_path = audio_svc.task_file_path(
+            r.task_id, f"{r.task_id}.mp3", date_str=r.date_str or None,
+        )
+        byte_size = mp3_path.stat().st_size if mp3_path.exists() else None
+        lrc_path = audio_svc.task_file_path(
+            r.task_id, f"{r.task_id}.LRC", date_str=r.date_str or None,
+        )
+        has_lrc = lrc_path.exists()
+        library_items.append(LibraryItemDto(
+            task_id=r.task_id,
+            original_filename=r.filename,
+            voice_id=r.voice_id,
+            duration_sec=None,
+            byte_size=byte_size,
+            created_at=r.created_at,
+            has_lrc=has_lrc,
+            provider=r.provider,
+        ))
+    return LibraryPageDto(items=library_items, page=page, size=size, total=total)
 
 
-@router.get("/library/{audio_id}", response_model=AudioDetailDto)
-async def get_library_item(audio_id: str) -> AudioDetailDto:
-    """Detail view: includes the original + normalized Markdown for the player."""
-    library = _require_library()
-    record = library.get(audio_id)
-    if record is None:
+@router.get("/library/{task_id}", response_model=LibraryDetailDto)
+async def get_library_item(task_id: str) -> LibraryDetailDto:
+    """听文档详情：从 task_dir 文件系统拼装 original_md + normalized_md。"""
+    task_store = _require_task_store()
+    audio_svc = _require_audio()
+    record = task_store.get(task_id)
+    if record is None or record.status != TASK_STATUS_DONE:
         raise HTTPException(status_code=404, detail="Library entry not found.")
-    return AudioDetailDto(
-        audio_id=record.audio_id,
-        original_filename=record.original_filename,
-        original_md=record.original_md,
-        normalized_md=record.normalized_md,
+
+    date_str = record.date_str or None
+    # original_md ← task_dir/<task_id>.md（本地清洗结果）
+    md_path = audio_svc.task_file_path(task_id, f"{task_id}.md", date_str=date_str)
+    original_md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    # normalized_md ← task_dir/normalization.md
+    norm_path = audio_svc.task_file_path(task_id, "normalization.md", date_str=date_str)
+    normalized_md = norm_path.read_text(encoding="utf-8") if norm_path.exists() else original_md
+
+    mp3_path = audio_svc.task_file_path(task_id, f"{task_id}.mp3", date_str=date_str)
+    byte_size = mp3_path.stat().st_size if mp3_path.exists() else None
+    lrc_path = audio_svc.task_file_path(task_id, f"{task_id}.LRC", date_str=date_str)
+    lrc_url = f"/api/lyrics/{task_id}.lrc" if lrc_path.exists() else None
+
+    return LibraryDetailDto(
+        task_id=record.task_id,
+        original_filename=record.filename,
+        original_md=original_md,
+        normalized_md=normalized_md,
         voice_id=record.voice_id,
-        duration_sec=record.duration_sec,
-        byte_size=record.byte_size,
+        duration_sec=None,
+        byte_size=byte_size,
         created_at=record.created_at,
-        audio_url=f"/api/audio/{record.audio_id}",
-        lyrics_url=(f"/api/lyrics/{audio_id}.lrc" if record.lyrics_path else None),
+        audio_url=f"/api/audio/{task_id}",
+        lrc_url=lrc_url,
+        provider=record.provider,
     )
 
 
-# ---- LRC 歌词文件下载（edge provider 自动落盘） -------------------------
+# ---- LRC 字幕文件下载（task_dir/<task_id>.LRC） ---------------------------
 
 
 @router.get("/lyrics/{filename}")
 async def get_lyrics(filename: str) -> FileResponse:
-    """下载 edge provider 在流水线里落盘的 LRC 字幕文件。
-
-    **注意**：转歌词功能已移除（不再有 ``/api/library/{id}/lyrics`` 主动生成
-    端点）。LRC 文件由 edge provider 自身在 ``run()`` 末尾根据 SentenceBoundary
-    cues 写入 ``outputs/audio/_artifacts/<audio_id>/<audio_id>.lrc``，本端点
-    只负责文件下载，供前端音乐播放器读取。
-    """
+    """下载 task_dir/<task_id>.LRC 文件。filename 形如 ``<task_id>.lrc``。"""
     audio_svc = _require_audio()
-    if "/" in filename or "\\" in filename or not filename.endswith(".lrc"):
+    task_store = _require_task_store()
+    if "/" in filename or "\\" in filename or not filename.lower().endswith(".lrc"):
         raise HTTPException(status_code=400, detail="Invalid lyrics filename.")
-    # 仅允许 audio_id 形式的 hex + .lrc 命名
-    stem = filename[:-4]
+    stem = filename[:-4]  # 去掉 .lrc
     if not stem or not all(c in "0123456789abcdef" for c in stem):
         raise HTTPException(status_code=400, detail="Invalid lyrics filename.")
-    path = audio_svc.resolve_lyrics(stem)
+    record = task_store.get(stem)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    path = audio_svc.resolve_lyrics(stem, date_str=record.date_str or None)
     if path is None:
         raise HTTPException(status_code=404, detail="Lyrics file not found.")
     return FileResponse(
-        path,
-        media_type="text/plain; charset=utf-8",
-        filename=filename,
+        path, media_type="text/plain; charset=utf-8", filename=filename,
         headers={"Cache-Control": "no-cache"},
     )
 
@@ -540,7 +710,6 @@ async def get_lyrics(filename: str) -> FileResponse:
 
 @router.get("/settings", response_model=SettingsDto)
 async def get_settings_api(settings: AppSettings = Depends(get_settings)) -> SettingsDto:
-    """获取当前运行时设置（含可用 TTS provider 列表 + edge voices）。"""
     cur = _active_provider
     return SettingsDto(
         tts_provider=cur,
@@ -556,7 +725,6 @@ async def update_settings_api(
     body: SettingsUpdateDto,
     settings: AppSettings = Depends(get_settings),
 ) -> SettingsDto:
-    """更新运行时设置（目前支持 tts_provider 切换）。"""
     if body.tts_provider is not None:
         _set_active_provider(body.tts_provider)
         logger.info("TTS provider switched to: %s", body.tts_provider)

@@ -42,13 +42,13 @@ _FENCE_LINE_RE = re.compile(r"^\s*```", re.MULTILINE)
 _OUTER_QUOTE_RE = re.compile(r'^[\s"\'`]+|[\s"\'`]+$')
 
 
-# 3 个 system prompt（m3 标准化 / 歌词 / 分块 / 方案二语义预处理）现在统一
+# 3 个 system prompt（m3 标准化 / 分块 / 方案二语义预处理）现在统一
 # 由 ``app.config`` 模块集中管理，并支持 env 覆盖：
 #   APP__M3_SYSTEM_PROMPT
-#   APP__LYRICS_SYSTEM_PROMPT
 #   APP__SPLIT_SYSTEM_PROMPT
 #   APP__SEMANTIC_PREPROCESS_PROMPT
 # 详见 ``app.config.get_*_prompt()`` accessor。
+# 注：APP__LYRICS_SYSTEM_PROMPT 已随「转歌词」功能（LyricsService）整体移除。
 
 
 class LlmNormalizer:
@@ -100,10 +100,6 @@ class LlmNormalizer:
             return self._post_process(content)
 
         raise LlmNormalizationError(f"M3 failed after retries: {last_err}")
-
-    async def make_lyrics(self, text: str, *, system: Optional[str] = None) -> str:
-        """Rewrite `text` as singable lyrics. Same retry/error contract as normalize()."""
-        return await self.normalize(text, system=system or get_lyrics_system_prompt())
 
     async def semantic_preprocess(self, text: str, *, system: Optional[str] = None) -> str:
         """方案二专用：让 M3 做语义预处理，输出含「多音字[读音]」标记和良好断句的

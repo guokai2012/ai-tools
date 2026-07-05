@@ -22,44 +22,6 @@ async def navigate(page, hash_route):
     await page.wait_for_timeout(900)
 
 
-async def capture_lyrics_flow(page, vp_name):
-    """听文档页 → 点击「转歌词」按钮 → 等生成完成 → 截图对话框。"""
-    await navigate(page, "/")
-    # 等待第一条听文档渲染
-    await page.wait_for_selector(".library-item", timeout=5000)
-    # 截图：列表带「转歌词」按钮的状态
-    await page.screenshot(path=str(OUT_DIR / f"lyrics-list-{vp_name}.png"),
-                          full_page=True)
-    print(f"  saved lyrics-list-{vp_name}.png")
-
-    # 点击第一个转歌词按钮
-    lyrics_btn = await page.query_selector(".lib-lyrics")
-    if lyrics_btn is None:
-        print(f"  WARN: no .lib-lyrics button on {vp_name}")
-        return
-    await lyrics_btn.click()
-    # 给 M3 mock 一个足够的时间完成（最长 4 秒）
-    try:
-        await page.wait_for_selector("#lyricsDialogPreview", timeout=2000)
-    except Exception:
-        pass
-    # 等到下载链接出现说明生成已完成
-    try:
-        await page.wait_for_selector("#lyricsDialogDownload:not([hidden])", timeout=5000)
-    except Exception:
-        # 仍在生成，截一张中间状态
-        await page.screenshot(path=str(OUT_DIR / f"lyrics-dialog-loading-{vp_name}.png"),
-                              full_page=True)
-        print(f"  saved lyrics-dialog-loading-{vp_name}.png")
-        return
-
-    # 等预览文字填充完整
-    await page.wait_for_timeout(400)
-    await page.screenshot(path=str(OUT_DIR / f"lyrics-dialog-{vp_name}.png"),
-                          full_page=True)
-    print(f"  saved lyrics-dialog-{vp_name}.png")
-
-
 async def main():
     async with async_playwright() as p:
         browser = await p.chromium.launch()
@@ -103,9 +65,6 @@ async def main():
                 await page.screenshot(path=str(OUT_DIR / f"task-{vp_name}.png"),
                                       full_page=True)
                 print(f"  saved task-{vp_name}.png")
-
-            # 歌词流程（点「转歌词」按钮 + 弹窗截图）
-            await capture_lyrics_flow(page, vp_name)
 
             await ctx.close()
         await browser.close()

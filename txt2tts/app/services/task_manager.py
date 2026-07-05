@@ -1,50 +1,99 @@
-"""后台任务管理器 —— 将 pipeline.run 的 async generator 包装为 asyncio 后台任务。
+"""后台任务管理器 —— 编排分步交互式 TTS 任务（v6：插入本地清洗步骤）。
 
-外部流程：
-    1. POST /api/tasks 收到上传 → TaskManager.create_task_and_persist
-       - 立即把原始 md 写到 outputs/uploads/<task_id>.md（"先落盘"）
-       - 在 tasks 表插入 pending 记录，关联 original_md_path
-       - 启动 asyncio.create_task 消费 pipeline.run
-    2. pipeline 每产出一个 ProgressEvent，TaskManager 更新 TaskStore。
-    3. 异常时（无论 pipeline 主动 error 还是协程异常）：
-       - 如果记录了 original_md_path 且文件还在 → status='failed_retryable'，
-         保留 md 文件 + 错误信息，前端可点"重试"
-       - 否则 status='error'（无法恢复的失败）
-    4. POST /api/tasks/{id}/retry → 从磁盘读 md 重新走 pipeline.run，
-       递增 retry_count 并清空 error。
-    5. 前端通过 GET /api/tasks 和 GET /api/tasks/{id} 轮询进度。
+v5 起移除本地 MarkdownService 清洗（指 M3 之前的预处理），M3 在 normalize
+阶段看到原文带 # / * / > / 列表 / 代码块 等结构，自行处理。
+
+v6 起在 ``splitted → ready_to_convert`` 之间插入"本地清洗"步骤：
+    - 用户复选清洗项（删除 URL / 邮箱 / 代码片段 / 表情 / Markdown 符号等）
+    - apply_local_clean 对每个 chunk 应用规则后**覆写** split_<N>.md
+    - 用户也可跳过（直接 splitted → ready_to_convert）
+
+新流程（v4 起 + v5 去本地清洗 + v6 加本地清洗）：
+    1. POST /api/tasks 收到上传
+       - 解码原始 markdown 文本（utf-8/gbk 兜底）
+       - 原文一字不动写入 outputs/<yyyymmdd>/<task_id>/<task_id>.md
+       - 在 tasks 表插入 status='draft' 的记录
+       - **不**启动任何后台协程；等待用户决定下一步
+    2. POST /api/tasks/{id}/normalize    → 异步 M3 标准化（喂原文）
+       draft → normalizing → ready_to_split（成功）
+                                 → draft（失败，记录 error 允许重试/跳过）
+    3. POST /api/tasks/{id}/skip-normalize  → 用原文（<task_id>.md）作为 normalization
+    4. POST /api/tasks/{id}/split       → 异步 M3 按用户提示词拆分
+       ready_to_split → splitting → splitted（成功）
+                                  → ready_to_split（失败）
+       → 写 split_<N>.md
+    5. POST /api/tasks/{id}/local-clean → 异步本地清洗（v6）
+       splitted → local_cleaning → local_cleaned（成功）
+                                  → splitted（失败回退）
+       → 覆写 split_<N>.md
+    6. POST /api/tasks/{id}/skip-local-clean → 跳过清洗（v6）
+       splitted → ready_to_convert
+    7. POST /api/tasks/{id}/confirm-split → 持久化用户确认的子文档
+       splitted/local_cleaned → ready_to_convert
+    8. POST /api/tasks/{id}/skip-split  → 复制 normalization.md → split_1.md
+    9. POST /api/tasks/{id}/convert     → 异步 TTS 转换（从 TTS 阶段开始）
+       ready_to_convert → converting → done（成功）/ error / failed_retryable
+                                   → subtitle_pending（minimax 字幕拉取失败，音频仍可用）
+
+阶段感知重试（v4 起 + v6 加 local_cleaning 回退）：
+    POST /api/tasks/{id}/retry → 后端根据 status + 已有字段决定从哪一阶段续跑：
+        * status=subtitle_pending → 仅重试字幕（走完整 convert）
+        * status=local_cleaning  → 回 splitted 后重做 local_clean_task（用历史 clean_options）
+        * status=error/failed_retryable：
+            - 无 normalized_text  → 重新 normalize
+            - 有 normalized_text 无 split_chunks → 重新 split（用历史 prompt）
+            - 有 split_chunks  → 重新 convert
+        * status=done → 409 不允许
+    前端只显示一个统一按钮；subtitle_pending 时按钮文案改为「🔁 重试字幕拉取」。
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from app.services.audio_storage import (
+    AudioStorageService,
+    TASK_STATUS_CONVERTING,
     TASK_STATUS_DONE,
+    TASK_STATUS_DRAFT,
     TASK_STATUS_ERROR,
     TASK_STATUS_FAILED_RETRYABLE,
-    TASK_STATUS_PENDING,
-    TASK_STATUS_PROCESSING,
-    AudioStorageService,
-    LibraryStore,
+    TASK_STATUS_LOCAL_CLEANED,
+    TASK_STATUS_LOCAL_CLEANING,
+    TASK_STATUS_NORMALIZING,
+    TASK_STATUS_READY_TO_CONVERT,
+    TASK_STATUS_READY_TO_SPLIT,
+    TASK_STATUS_SPLITTED,
+    TASK_STATUS_SPLITTING,
+    TASK_STATUS_SUBTITLE_PENDING,
     TaskRecord,
     TaskStore,
+    task_date_str,
 )
+from app.services.llm_normalizer import LlmNormalizationError, LlmNormalizer
 from app.services.pipeline import ProgressEvent, TtsPipeline
+from app.services.text_cleaner import apply_local_clean, clean_summary
 
 logger = logging.getLogger(__name__)
 
 
-# 任务状态：用于 TaskStore.status 字段（前端识别）
-# 状态常量已迁移到 audio_storage.py 以便 watchdog 等其他模块复用；
-# 这里 re-export 仅作向后兼容。
 __all__ = [
-    "TASK_STATUS_PENDING",
-    "TASK_STATUS_PROCESSING",
+    "TASK_STATUS_DRAFT",
+    "TASK_STATUS_NORMALIZING",
+    "TASK_STATUS_NORMALIZED",
+    "TASK_STATUS_READY_TO_SPLIT",
+    "TASK_STATUS_SPLITTING",
+    "TASK_STATUS_SPLITTED",
+    "TASK_STATUS_LOCAL_CLEANING",
+    "TASK_STATUS_LOCAL_CLEANED",
+    "TASK_STATUS_READY_TO_CONVERT",
+    "TASK_STATUS_CONVERTING",
+    "TASK_STATUS_SUBTITLE_PENDING",
     "TASK_STATUS_DONE",
     "TASK_STATUS_ERROR",
     "TASK_STATUS_FAILED_RETRYABLE",
@@ -53,100 +102,70 @@ __all__ = [
 
 
 class TaskManager:
-    """负责创建 / 运行 / 查询后台 TTS 转换任务（含重试）。"""
+    """负责编排分步交互式 TTS 任务的生命周期。
+
+    不再依赖 LibraryStore / uploads_dir / MarkdownService；唯一外部依赖是：
+      - audio_storage: 写 task_dir 文件 + 删除整个 task_dir
+      - task_store:    SQLite tasks 表读写
+      - pipeline:      实际 TTS 转换执行器
+      - llm:           分步流程中标准化和拆分需要
+
+    v5 起原始 Markdown 直接由 create_task 写盘 + 入库，M3 在 normalize 阶段处理。
+    """
 
     def __init__(
         self,
         pipeline: TtsPipeline,
         task_store: TaskStore,
+        audio_storage: AudioStorageService,
         *,
-        uploads_dir: Path,
-        audio_storage: Optional[AudioStorageService] = None,
-        library: Optional[LibraryStore] = None,
+        llm: Optional[LlmNormalizer] = None,
     ) -> None:
         self._pipeline = pipeline
         self._task_store = task_store
-        self._uploads_dir = Path(uploads_dir).resolve()
-        self._uploads_dir.mkdir(parents=True, exist_ok=True)
-        # 可选：注入后 delete_task 能完整清理文件 + 数据库行
-        self._audio_storage = audio_storage
-        self._library = library
+        self._audio = audio_storage
+        self._llm = llm
 
     @property
     def provider(self) -> str:
-        """当前 pipeline 使用的 TTS provider（用于 tasks.provider 列）。
-
-        测试里经常传入 ``MagicMock()`` 充当 pipeline，此时 ``_provider``
-        也是 MagicMock，需要回落成 ``"mimo"`` 字符串。
-        """
-        val = getattr(self._pipeline, "_provider", "mimo")
-        return val if isinstance(val, str) else "mimo"
+        """当前 pipeline 使用的 TTS provider。"""
+        val = getattr(self._pipeline, "_provider", "minimax")
+        return val if isinstance(val, str) else "minimax"
 
     # -- delete -------------------------------------------------------------
 
     def delete_task(self, task_id: str) -> dict:
-        """删除一个任务及其派生文件。
+        """删除任务：rmtree 整个 task_dir + 删 tasks 表行。
 
-        语义：
-            * ``status='done'`` 的任务：保留最终播放所需的 ``audio/<audio_id>.mp3`` +
-              ``audio/_artifacts/<audio_id>/``（中间产物快照 + 原始 md），其余全部清空。
-              同时从 ``audio_records`` 表删除该条（听文档页不再展示），但 ``audio/<id>.mp3``
-              物理文件保留，理论上可被未来的"恢复听文档"或外部引用。
-            * 其它状态（pending / processing / error / failed_retryable）：彻底删除
-              包括 uploads / chunks / segments / tasks 行。
-              如果任务曾经成功过（retry_count>0 但 status 是 failed），也会保留
-              旧 audio_id 的成品与 artifacts。
-
-        返回 dict 包含 ``removed`` 文件分类统计、``audio_id``、``status``、``kept_final_audio``。
+        听文档数据来自 tasks 表的 status='done' 行；删 task_id 后听文档自动不显示。
         """
         record = self._task_store.get(task_id)
         if record is None:
             return {"found": False, "task_id": task_id}
 
-        audio_id = record.audio_id
-        # 任务成功过 → 保留最终音频 + artifacts；其它情况一律清空
-        keep_final = bool(audio_id) and record.status == TASK_STATUS_DONE
+        # 删整个任务目录（包含 <task_id>.mp3 / SRT / LRC / 中间 md 等所有产物）
+        file_result = self._audio.delete_task_files(
+            task_id, date_str=record.date_str or None,
+        )
 
-        removed_files: dict = {}
-        if self._audio_storage is not None:
-            removed_files = self._audio_storage.delete_task_files(
-                task_id=task_id,
-                audio_id=audio_id,
-                keep_final_audio=keep_final,
-            )
-
-        # 删 audio_records 行（听文档不再展示）
-        # 注意：即使 keep_final=True 也删表行；音频物理文件保留以防后续"复活"
-        library_deleted = False
-        if self._library is not None and audio_id:
-            try:
-                library_deleted = self._library.delete(audio_id)
-            except Exception:
-                logger.exception(
-                    "library.delete failed for audio_id=%s", audio_id,
-                )
-
-        # 最后删 tasks 行
-        tasks_deleted = self._task_store.delete(task_id)
+        # 删 tasks 表行
+        deleted = self._task_store.delete(task_id)
 
         logger.info(
-            "TaskManager.delete_task: task_id=%s status=%s audio_id=%s "
-            "keep_final=%s removed=%s library_row=%s",
-            task_id, record.status, audio_id, keep_final,
-            removed_files, library_deleted,
+            "TaskManager.delete_task: task_id=%s status=%s date=%s "
+            "removed_files=%s tasks_row=%s",
+            task_id, record.status, record.date_str,
+            file_result, deleted,
         )
         return {
             "found": True,
             "task_id": task_id,
-            "audio_id": audio_id,
             "status": record.status,
-            "kept_final_audio": keep_final,
-            "removed_files": removed_files,
-            "library_row_deleted": library_deleted,
-            "tasks_row_deleted": tasks_deleted,
+            "removed_files": file_result,
+            "tasks_row_deleted": deleted,
         }
 
-    # -- public API --------------------------------------------------------
+    # -- create (upload) ---------------------------------------------------
 
     def create_task(
         self,
@@ -156,131 +175,679 @@ class TaskManager:
         voice_id: Optional[str] = None,
         default_voice_id: Optional[str] = None,
     ) -> str:
-        """创建一条任务：
+        """创建一条草稿任务。
 
-        1. 立即把原始 md 落盘到 uploads/<task_id>.md
-        2. 在 tasks 表插入 pending 记录
-        3. 启动后台协程消费 pipeline.run
+        v5 起：原始 Markdown 直接落盘 + 入库，不做本地清洗。
+        1. 解码原始 markdown 文本（utf-8/gbk 兜底）
+        2. 原文一字不动写到 outputs/<yyyymmdd>/<task_id>/<task_id>.md
+        3. 在 tasks 表插入 status='draft' 的记录，local_clean_text 存原文
+           （v4 旧字段保留，含义从『本地清洗结果』改为『原文』，跳过标准化时复用）
 
         返回 task_id。
         """
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         task_id = uuid.uuid4().hex
-        md_path = self._save_upload(task_id, raw)
-        rel_md_path = str(md_path.relative_to(self._uploads_dir.parent)) \
-            if md_path.is_relative_to(self._uploads_dir.parent) \
-            else str(md_path)
+        date_str = task_date_str()
 
+        # v5：原始 markdown 文本（不做任何清洗）
+        try:
+            raw_text = self._decode(raw)
+        except Exception as exc:
+            logger.exception("decode raw bytes failed for %s", filename)
+            raw_text = ""
+            decode_error = str(exc)
+        else:
+            decode_error = None
+
+        task_dir = self._audio.task_dir(task_id, date_str=date_str)
+        task_md_path = task_dir / f"{task_id}.md"
+        try:
+            task_md_path.write_text(raw_text, encoding="utf-8")
+        except Exception as exc:
+            logger.exception("write task_dir/<task_id>.md failed")
+            decode_error = f"{decode_error or ''}; write failed: {exc}"
+
+        original_md_path = f"{date_str}/{task_id}/{task_id}.md"
+        message = (
+            f"原文已落盘 · {len(raw_text)} 字符 · 待标准化"
+            if raw_text else f"原文写入失败：{decode_error}"
+        )
         record = TaskRecord(
             task_id=task_id,
             filename=filename,
             voice_id=voice_id or default_voice_id,
-            status=TASK_STATUS_PENDING,
-            current_stage=None,
+            status=TASK_STATUS_DRAFT,
+            current_stage="draft",
             progress=0.0,
-            message="等待处理…",
-            audio_id=None,
-            error=None,
+            message=message,
+            date_str=date_str,
+            error=decode_error,
             created_at=now,
             updated_at=now,
-            original_md_path=rel_md_path,
             retry_count=0,
             provider=self.provider,
+            original_md_path=original_md_path,
+            local_clean_text=raw_text,
         )
         self._task_store.insert(record)
-        asyncio.create_task(
-            self._run_pipeline_from_memory(task_id, raw, filename, voice_id, default_voice_id)
+        logger.info(
+            "Task %s created as draft (date=%s, raw_text=%d chars, path=%s)",
+            task_id, date_str, len(raw_text), task_md_path,
         )
-        logger.info("Task %s created for %s (md saved at %s)", task_id, filename, md_path)
         return task_id
 
-    def retry_task(self, task_id: str) -> bool:
-        """根据 task_id 重试失败任务。从磁盘读原始 md 重新跑 pipeline。
+    # -- normalize step ----------------------------------------------------
 
-        返回是否成功触发（False 表示任务不存在 / 状态不允许重试 / md 文件丢失）。
+    def normalize_task(self, task_id: str, system_prompt: Optional[str] = None) -> bool:
+        """触发 M3 标准化（异步）。仅 draft 状态可调用。
+
+        v6 起支持自定义 system_prompt：None → llm_normalizer 内部走
+        get_m3_system_prompt() 默认值；非 None → 直接传给 M3。
         """
         record = self._task_store.get(task_id)
         if record is None:
-            logger.warning("retry_task: task %s not found", task_id)
             return False
-        if record.status not in (TASK_STATUS_FAILED_RETRYABLE, TASK_STATUS_ERROR):
-            logger.warning("retry_task: task %s status=%s not retryable", task_id, record.status)
-            return False
-        if not record.original_md_path:
-            logger.warning("retry_task: task %s has no original_md_path", task_id)
-            return False
-        md_path = self._uploads_dir.parent / record.original_md_path
-        if not md_path.exists():
-            logger.error("retry_task: original md missing at %s", md_path)
-            # 标记成不可重试 error
-            self._task_store.update_progress(
-                task_id,
-                status=TASK_STATUS_ERROR,
-                message="原始 md 文件已丢失，无法重试",
-                error="original md missing",
+        if record.status != TASK_STATUS_DRAFT:
+            logger.warning(
+                "normalize_task: task %s status=%s (not draft)", task_id, record.status,
             )
             return False
-        raw = md_path.read_bytes()
-        new_retry_count = record.retry_count + 1
-        # 重置 progress / error / status
+        if self._llm is None:
+            raise RuntimeError("normalize_task requires llm service injection")
+
         self._task_store.update_progress(
             task_id,
-            status=TASK_STATUS_PENDING,
-            current_stage=None,
-            progress=0.0,
-            message=f"准备第 {new_retry_count} 次重试…",
+            status=TASK_STATUS_NORMALIZING,
+            current_stage="llm_normalize",
+            progress=0.15,
+            message="M3 标准化中…",
+            clear_error=True,
+        )
+        asyncio.create_task(self._do_normalize(task_id, record, system_prompt))
+        return True
+
+    async def _do_normalize(
+        self, task_id: str, record: TaskRecord,
+        system_prompt: Optional[str] = None,
+    ) -> None:
+        """后台协程：M3 标准化 draft 任务，写 normalization.md 到 task_dir。"""
+        try:
+            normalized = await self._llm.normalize(
+                record.local_clean_text or "",
+                system=system_prompt,
+            )
+        except LlmNormalizationError as exc:
+            logger.exception("normalize_task %s failed", task_id)
+            self._task_store.update_progress(
+                task_id,
+                status=TASK_STATUS_DRAFT,
+                current_stage="llm_normalize",
+                message=f"M3 标准化失败：{exc}",
+                error=str(exc),
+            )
+            return
+        except Exception as exc:
+            logger.exception("normalize_task %s crashed", task_id)
+            self._task_store.update_progress(
+                task_id,
+                status=TASK_STATUS_DRAFT,
+                current_stage="llm_normalize",
+                message=f"M3 标准化异常：{exc}",
+                error=str(exc),
+            )
+            return
+
+        # 写 normalization.md 到 task_dir
+        try:
+            task_md = self._audio.task_file_path(
+                task_id, "normalization.md", date_str=record.date_str,
+            )
+            task_md.write_text(normalized, encoding="utf-8")
+        except Exception:
+            logger.exception("write normalization.md failed for %s", task_id)
+
+        self._task_store.update_progress(
+            task_id,
+            status=TASK_STATUS_READY_TO_SPLIT,
+            current_stage="llm_normalize",
+            progress=0.30,
+            message=f"M3 标准化完成 · {len(normalized)} 字符 · 待拆分",
+            normalized_text=normalized,
+            clear_error=True,
+        )
+        logger.info("Task %s normalized (%d chars)", task_id, len(normalized))
+
+    def skip_normalize(self, task_id: str) -> bool:
+        """跳过标准化：复制 ``<task_id>.md`` 到 ``normalization.md``。"""
+        record = self._task_store.get(task_id)
+        if record is None or record.status != TASK_STATUS_DRAFT:
+            return False
+        date_str = record.date_str
+        src = self._audio.task_file_path(task_id, f"{task_id}.md", date_str=date_str)
+        dst = self._audio.task_file_path(task_id, "normalization.md", date_str=date_str)
+        try:
+            if src.exists():
+                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            logger.exception("skip_normalize copy failed for %s", task_id)
+            return False
+        normalized = record.local_clean_text or ""
+        self._task_store.update_progress(
+            task_id,
+            status=TASK_STATUS_READY_TO_SPLIT,
+            current_stage="draft",
+            progress=0.20,
+            message="已跳过标准化（原文直接进拆分）· 待拆分",
+            normalized_text=normalized,
+        )
+        return True
+
+    # -- split step --------------------------------------------------------
+
+    def split_task(self, task_id: str, prompt: str) -> bool:
+        """触发 M3 拆分（异步）。仅 ready_to_split / splitted 可调用（允许重新拆分）。"""
+        record = self._task_store.get(task_id)
+        if record is None:
+            return False
+        if record.status not in (TASK_STATUS_READY_TO_SPLIT, TASK_STATUS_SPLITTED):
+            logger.warning(
+                "split_task: task %s status=%s (not ready_to_split/splitted)",
+                task_id, record.status,
+            )
+            return False
+        if not record.normalized_text:
+            return False
+        if self._llm is None:
+            raise RuntimeError("split_task requires llm service injection")
+
+        self._task_store.update_progress(
+            task_id,
+            status=TASK_STATUS_SPLITTING,
+            current_stage="llm_split",
+            progress=0.45,
+            message="M3 拆分子文档中…",
+            split_prompt=prompt,
+            clear_error=True,
+        )
+        asyncio.create_task(self._do_split(task_id, record, prompt))
+        return True
+
+    async def _do_split(self, task_id: str, record: TaskRecord, prompt: str) -> None:
+        """后台协程：M3 拆分 normalized_text，写 split_<N>.md 到 task_dir。"""
+        try:
+            chunks = await self._llm.split_text(
+                record.normalized_text,  # type: ignore[arg-type]
+                system=prompt,
+            )
+        except LlmNormalizationError as exc:
+            logger.exception("split_task %s failed", task_id)
+            self._task_store.update_progress(
+                task_id,
+                status=TASK_STATUS_READY_TO_SPLIT,
+                current_stage="llm_split",
+                message=f"M3 拆分失败：{exc}",
+                error=str(exc),
+            )
+            return
+        except Exception as exc:
+            logger.exception("split_task %s crashed", task_id)
+            self._task_store.update_progress(
+                task_id,
+                status=TASK_STATUS_READY_TO_SPLIT,
+                current_stage="llm_split",
+                message=f"M3 拆分异常：{exc}",
+                error=str(exc),
+            )
+            return
+
+        # 写 split_<N>.md
+        try:
+            for i, ch in enumerate(chunks, 1):
+                p = self._audio.task_file_path(
+                    task_id, f"split_{i}.md", date_str=record.date_str,
+                )
+                p.write_text(ch, encoding="utf-8")
+        except Exception:
+            logger.exception("write split_<N>.md failed for %s", task_id)
+
+        self._task_store.update_progress(
+            task_id,
+            status=TASK_STATUS_SPLITTED,
+            current_stage="llm_split",
+            progress=0.55,
+            message=f"M3 拆分完成 · {len(chunks)} 个子文档 · 待确认",
+            split_chunks=json.dumps(chunks, ensure_ascii=False),
+            clear_error=True,
+        )
+        logger.info("Task %s split into %d chunks", task_id, len(chunks))
+
+    def confirm_split(
+        self,
+        task_id: str,
+        chunks: Optional[List[str]] = None,
+    ) -> bool:
+        """用户确认子文档 → ready_to_convert。
+
+        chunks=None：使用 M3 原始拆分结果（从 split_<N>.md 重读，或 split_chunks JSON）。
+        chunks=list：使用用户编辑后的子文档（同时覆盖写 split_<N>.md）。
+
+        v6 起：从 ``splitted`` 或 ``local_cleaned`` 都可确认。
+        """
+        record = self._task_store.get(task_id)
+        if record is None:
+            return False
+        if record.status not in (TASK_STATUS_SPLITTED, TASK_STATUS_LOCAL_CLEANED):
+            return False
+        date_str = record.date_str
+
+        if chunks is None:
+            # 默认走数据库里 M3 原始拆分结果；同时校验 split_<N>.md 是否都存在
+            if not record.split_chunks:
+                return False
+            try:
+                chunks = json.loads(record.split_chunks)
+            except json.JSONDecodeError:
+                logger.exception("split_chunks 解析失败 for task %s", task_id)
+                return False
+            # 校验 split_<N>.md 都存在
+            for i in range(1, len(chunks) + 1):
+                p = self._audio.task_file_path(task_id, f"split_{i}.md", date_str=date_str)
+                if not p.exists():
+                    logger.warning("confirm_split: split_%d.md missing for %s", i, task_id)
+        # 过滤空 chunk
+        chunks = [c for c in chunks if c and c.strip()]
+        if not chunks:
+            self._task_store.update_progress(
+                task_id,
+                error="子文档全部为空，请重新拆分或跳过",
+            )
+            return False
+        # 同步重写 split_<N>.md（用户编辑后覆盖）
+        try:
+            for i, ch in enumerate(chunks, 1):
+                p = self._audio.task_file_path(
+                    task_id, f"split_{i}.md", date_str=date_str,
+                )
+                p.write_text(ch, encoding="utf-8")
+        except Exception:
+            logger.exception("confirm_split write split_<N>.md failed for %s", task_id)
+
+        self._task_store.update_progress(
+            task_id,
+            status=TASK_STATUS_READY_TO_CONVERT,
+            current_stage="ready",
+            progress=0.65,
+            message=f"子文档已确认 · {len(chunks)} 个 · 待转换",
+            split_chunks=json.dumps(chunks, ensure_ascii=False),
+        )
+        return True
+
+    def skip_split(self, task_id: str) -> bool:
+        """跳过拆分：复制 normalization.md → split_1.md。"""
+        record = self._task_store.get(task_id)
+        if record is None:
+            return False
+        if record.status not in (TASK_STATUS_READY_TO_SPLIT, TASK_STATUS_SPLITTED):
+            return False
+        date_str = record.date_str
+        src = self._audio.task_file_path(task_id, "normalization.md", date_str=date_str)
+        dst = self._audio.task_file_path(task_id, "split_1.md", date_str=date_str)
+        try:
+            if src.exists():
+                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+        except Exception:
+            logger.exception("skip_split copy failed for %s", task_id)
+            return False
+        chunks = [src.read_text(encoding="utf-8")]
+        self._task_store.update_progress(
+            task_id,
+            status=TASK_STATUS_READY_TO_CONVERT,
+            current_stage="ready",
+            progress=0.60,
+            message="已跳过拆分 · 待转换（将使用自动切分）",
+            split_chunks=json.dumps(chunks, ensure_ascii=False),
+        )
+        return True
+
+    # -- local clean step (v6) ---------------------------------------------
+
+    def local_clean_task(self, task_id: str, enabled_ids: List[str]) -> bool:
+        """splitted → local_cleaning → local_cleaned
+
+        异步对每个 chunk 应用 ``apply_local_clean``，覆写 ``split_<N>.md``。
+        失败回 ``splitted``；前端可继续重新发起。
+        """
+        record = self._task_store.get(task_id)
+        if record is None:
+            return False
+        if record.status != TASK_STATUS_SPLITTED:
+            logger.warning(
+                "local_clean_task: task %s status=%s (not splitted)",
+                task_id, record.status,
+            )
+            return False
+        if not record.split_chunks:
+            self._task_store.update_progress(
+                task_id,
+                error="缺少 split_chunks，无法本地清洗",
+            )
+            return False
+        # 校验 enabled_ids：未知 id 静默丢弃（保持与 apply_local_clean 一致）
+        from app.services.text_cleaner import CLEAN_OPTIONS as _CO
+        valid_ids = {opt["id"] for opt in _CO}
+        enabled_ids = [cid for cid in enabled_ids if cid in valid_ids]
+
+        # 立即切到 local_cleaning，写入 clean_options
+        self._task_store.update_progress(
+            task_id,
+            status=TASK_STATUS_LOCAL_CLEANING,
+            current_stage="local_clean",
+            progress=0.62,
+            message=f"本地清洗中…（{len(enabled_ids)} 项）",
+            clean_options=json.dumps(enabled_ids, ensure_ascii=False),
+            clear_error=True,
+        )
+        # 解析 chunks
+        try:
+            chunks = json.loads(record.split_chunks)
+        except json.JSONDecodeError:
+            logger.exception("local_clean_task split_chunks parse failed for %s", task_id)
+            self._task_store.update_progress(
+                task_id,
+                status=TASK_STATUS_SPLITTED,
+                error="split_chunks 解析失败",
+            )
+            return False
+
+        asyncio.create_task(self._do_local_clean(task_id, chunks, enabled_ids))
+        return True
+
+    async def _do_local_clean(
+        self, task_id: str, chunks: List[str], enabled_ids: List[str],
+    ) -> None:
+        """后台协程：对每个 chunk 应用 apply_local_clean，覆写 split_<N>.md。
+
+        本地清洗是纯正则替换，无网络/IO 调用；理论上不应失败，但仍保留
+        异常回退（disk full / permission error 等）。
+        """
+        record = self._task_store.get(task_id)
+        if record is None:
+            return
+        date_str = record.date_str
+        try:
+            cleaned = [
+                apply_local_clean(c, enabled_ids) if c and c.strip() else c
+                for c in chunks
+            ]
+            for i, c in enumerate(cleaned, 1):
+                p = self._audio.task_file_path(
+                    task_id, f"split_{i}.md", date_str=date_str,
+                )
+                p.write_text(c, encoding="utf-8")
+            before_total = sum(len(c) for c in chunks if c)
+            after_total = sum(len(c) for c in cleaned if c)
+            self._task_store.update_progress(
+                task_id,
+                status=TASK_STATUS_LOCAL_CLEANED,
+                current_stage="local_cleaned",
+                progress=0.65,
+                message=(
+                    f"本地清洗完成 · {len(enabled_ids)} 项 · "
+                    f"{len(cleaned)} 个子文档 · "
+                    f"删除 {max(0, before_total - after_total)} 字符"
+                ),
+                split_chunks=json.dumps(cleaned, ensure_ascii=False),
+            )
+            logger.info(
+                "local_clean_task %s done: %d options, %d chunks, %d → %d chars",
+                task_id, len(enabled_ids), len(cleaned), before_total, after_total,
+            )
+        except Exception as exc:
+            logger.exception("local_clean_task %s failed", task_id)
+            self._task_store.update_progress(
+                task_id,
+                status=TASK_STATUS_SPLITTED,
+                error=f"local_clean failed: {exc}",
+            )
+
+    def skip_local_clean(self, task_id: str) -> bool:
+        """跳过本地清洗：splitted → ready_to_convert，clean_options 留空。"""
+        record = self._task_store.get(task_id)
+        if record is None:
+            return False
+        if record.status != TASK_STATUS_SPLITTED:
+            logger.warning(
+                "skip_local_clean: task %s status=%s (not splitted)",
+                task_id, record.status,
+            )
+            return False
+        self._task_store.update_progress(
+            task_id,
+            status=TASK_STATUS_READY_TO_CONVERT,
+            current_stage="ready",
+            progress=0.65,
+            message="已跳过本地清洗 · 待转换",
+            clean_options=json.dumps([], ensure_ascii=False),
+        )
+        return True
+
+    # -- convert step ------------------------------------------------------
+
+    def convert_task(self, task_id: str) -> bool:
+        """启动 TTS 转换（异步）。仅 ready_to_convert 状态可调用。"""
+        record = self._task_store.get(task_id)
+        if record is None:
+            return False
+        if record.status != TASK_STATUS_READY_TO_CONVERT:
+            logger.warning(
+                "convert_task: task %s status=%s (not ready_to_convert)",
+                task_id, record.status,
+            )
+            return False
+        if not record.normalized_text:
+            return False
+
+        self._task_store.update_progress(
+            task_id,
+            status=TASK_STATUS_CONVERTING,
+            current_stage="tts_synthesize",
+            progress=0.70,
+            message="TTS 转换中…",
+            clear_error=True,
+        )
+        asyncio.create_task(self._do_convert(task_id, record))
+        return True
+
+    async def _do_convert(self, task_id: str, record: TaskRecord) -> None:
+        """后台协程：消费 pipeline.run_from_normalized。
+
+        minimax 字幕失败处理：done event 携带 subtitle_status='pending' 时
+        任务转 subtitle_pending；pipeline 已写好 <task_id>.mp3，音频可听。
+        """
+        pre_split_chunks: Optional[List[str]] = None
+        if record.split_chunks:
+            try:
+                pre_split_chunks = json.loads(record.split_chunks)
+                if not pre_split_chunks:
+                    pre_split_chunks = None
+            except json.JSONDecodeError:
+                pre_split_chunks = None
+
+        # 把 task_id 暴露给 pipeline（用于写 task_dir/.../<task_id>.{md,mp3,srt,lrc}）
+        self._pipeline._task_id = task_id
+        try:
+            async for event in self._pipeline.run_from_normalized(
+                record.normalized_text,  # type: ignore[arg-type]
+                filename=record.filename,
+                voice_id=record.voice_id,
+                pre_split_chunks=pre_split_chunks,
+            ):
+                self._apply_event(task_id, event)
+                if event.stage == "done" and event.subtitle_status == "pending":
+                    self._mark_subtitle_pending(task_id, event.subtitle_error or "")
+        except Exception as exc:
+            logger.exception("convert_task %s pipeline crashed", task_id)
+            self._mark_failed(task_id, exc)
+        finally:
+            self._pipeline._task_id = None
+
+    # -- retry (v4 阶段感知) -----------------------------------------------
+
+    def retry_task(self, task_id: str) -> bool:
+        """阶段感知重试（详见模块 docstring 决策表）。"""
+        record = self._task_store.get(task_id)
+        if record is None:
+            return False
+
+        new_retry_count = record.retry_count + 1
+
+        # 1) 字幕待重试
+        if record.status == TASK_STATUS_SUBTITLE_PENDING:
+            return self._retry_subtitle(task_id, record, new_retry_count)
+
+        # 2) error / failed_retryable
+        if record.status in (TASK_STATUS_FAILED_RETRYABLE, TASK_STATUS_ERROR):
+            # 检查原始 md 完整性（任何阶段都需要）
+            if not record.original_md_path:
+                self._task_store.update_progress(
+                    task_id,
+                    status=TASK_STATUS_ERROR,
+                    message="任务记录缺少 original_md_path，无法重试",
+                    error="original_md_path missing",
+                )
+                return False
+            md_full = self._audio._root / record.original_md_path
+            if not md_full.exists():
+                self._task_store.update_progress(
+                    task_id,
+                    status=TASK_STATUS_ERROR,
+                    message="原始 md 文件已丢失，无法重试",
+                    error="original md missing",
+                )
+                return False
+
+            # 没有 normalized_text → 从 normalize 开始
+            if not record.normalized_text:
+                if self._llm is None:
+                    self._task_store.update_progress(
+                        task_id,
+                        status=TASK_STATUS_ERROR,
+                        message="LLM 服务未配置，无法重试 normalize",
+                        error="llm not configured",
+                    )
+                    return False
+                self._task_store.update_progress(
+                    task_id,
+                    status=TASK_STATUS_DRAFT,
+                    current_stage="draft",
+                    progress=0.05,
+                    message=f"准备第 {new_retry_count} 次重试（重做标准化）…",
+                    retry_count=new_retry_count,
+                    clear_error=True,
+                )
+                logger.info(
+                    "retry_task: %s 从 normalize 阶段续跑（retry #%d）",
+                    task_id, new_retry_count,
+                )
+                return self.normalize_task(task_id)
+
+            # 有 normalized_text 但没 split_chunks → 从 split 开始
+            if not record.split_chunks:
+                if self._llm is None:
+                    return self._retry_to_convert(task_id, record, new_retry_count,
+                                                   note="无 LLM，跳过拆分直接重转")
+                prompt = record.split_prompt or ""
+                self._task_store.update_progress(
+                    task_id,
+                    status=TASK_STATUS_READY_TO_SPLIT,
+                    current_stage="ready",
+                    progress=0.40,
+                    message=f"准备第 {new_retry_count} 次重试（重做拆分）…",
+                    retry_count=new_retry_count,
+                    clear_error=True,
+                )
+                logger.info(
+                    "retry_task: %s 从 split 阶段续跑（retry #%d, prompt=%d chars）",
+                    task_id, new_retry_count, len(prompt),
+                )
+                return self.split_task(task_id, prompt)
+
+            # 局部清洗中途失败（罕见：纯正则，但保留防御）→ 回 splitted
+            if record.status == TASK_STATUS_LOCAL_CLEANING:
+                self._task_store.update_progress(
+                    task_id,
+                    status=TASK_STATUS_SPLITTED,
+                    current_stage="splitted",
+                    progress=0.60,
+                    message=f"准备第 {new_retry_count} 次重试（重新本地清洗）…",
+                    retry_count=new_retry_count,
+                    clear_error=True,
+                )
+                enabled = []
+                if record.clean_options:
+                    try:
+                        enabled = json.loads(record.clean_options)
+                    except json.JSONDecodeError:
+                        enabled = []
+                logger.info(
+                    "retry_task: %s 从 local_clean 阶段续跑（retry #%d, %d options）",
+                    task_id, new_retry_count, len(enabled),
+                )
+                return self.local_clean_task(task_id, enabled)
+
+            # 都有：直接重跑 convert
+            return self._retry_to_convert(task_id, record, new_retry_count,
+                                           note="从 convert 阶段续跑")
+
+        # 3) 其他状态不允许
+        return False
+
+    def _retry_to_convert(
+        self, task_id: str, record: TaskRecord, new_retry_count: int, *,
+        note: str,
+    ) -> bool:
+        self._task_store.update_progress(
+            task_id,
+            status=TASK_STATUS_READY_TO_CONVERT,
+            current_stage="ready",
+            progress=0.60,
+            message=f"准备第 {new_retry_count} 次重试（{note}）…",
             retry_count=new_retry_count,
             clear_error=True,
         )
-        # 启动后台协程
-        voice_id = record.voice_id
-        asyncio.create_task(
-            self._run_pipeline_from_memory(
-                task_id, raw, record.filename, voice_id, voice_id,
-            )
+        logger.info(
+            "retry_task: %s %s（retry #%d）", task_id, note, new_retry_count,
         )
-        logger.info("Task %s retried (retry_count=%d)", task_id, new_retry_count)
-        return True
+        return self.convert_task(task_id)
+
+    def _retry_subtitle(
+        self, task_id: str, record: TaskRecord, new_retry_count: int,
+    ) -> bool:
+        """仅重试字幕拉取：走完整 convert（minimax 当前字幕与音频合成耦合）。"""
+        if not record.normalized_text:
+            self._task_store.update_progress(
+                task_id,
+                status=TASK_STATUS_FAILED_RETRYABLE,
+                message="重试字幕失败：缺少 normalized_text",
+                error="retry_subtitle: missing normalized_text",
+            )
+            return False
+        self._task_store.update_progress(
+            task_id,
+            status=TASK_STATUS_READY_TO_CONVERT,
+            current_stage="subtitle_retry",
+            progress=0.60,
+            message=f"准备第 {new_retry_count} 次字幕重试（重新跑 convert）…",
+            retry_count=new_retry_count,
+            clear_error=True,
+        )
+        logger.info(
+            "retry_task: %s 仅字幕重试（retry #%d），走完整 convert",
+            task_id, new_retry_count,
+        )
+        return self.convert_task(task_id)
 
     # -- internal ----------------------------------------------------------
-
-    def _save_upload(self, task_id: str, raw: bytes) -> Path:
-        """把原始 md 字节写到 uploads/<task_id>.md，返回绝对路径。"""
-        path = self._uploads_dir / f"{task_id}.md"
-        path.write_bytes(raw)
-        return path
-
-    async def _run_pipeline_from_memory(
-        self,
-        task_id: str,
-        raw: bytes,
-        filename: str,
-        voice_id: Optional[str],
-        default_voice_id: Optional[str],
-    ) -> None:
-        """从内存中的 md 字节跑 pipeline（适用于首次创建 + 重试）。"""
-        # 标记为处理中
-        self._task_store.update_progress(
-            task_id, status=TASK_STATUS_PROCESSING, current_stage="start",
-            message="开始处理…",
-        )
-        # 把 task_id 暴露给 pipeline，run() 末尾成功后会用 promote_artifacts()
-        # 把 chunks/segments/uploads.md 统一搬到 audio/_artifacts/<audio_id>/
-        self._pipeline._task_id = task_id
-        try:
-            async for event in self._pipeline.run(
-                raw,
-                filename=filename,
-                voice_id=voice_id,
-                default_voice_id=default_voice_id,
-            ):
-                self._apply_event(task_id, event)
-        except Exception as exc:
-            logger.exception("Task %s pipeline crashed", task_id)
-            self._mark_failed(task_id, exc)
-        finally:
-            # 清理挂载（同一 pipeline 实例可能被后续任务复用）
-            self._pipeline._task_id = None
 
     def _mark_failed(self, task_id: str, exc: BaseException) -> None:
         """统一失败处理：检查原始 md 是否仍在，决定 failed_retryable vs error。"""
@@ -288,16 +855,15 @@ class TaskManager:
         md_alive = (
             record is not None
             and bool(record.original_md_path)
-            and (self._uploads_dir.parent / record.original_md_path).exists()
+            and (self._audio._root / record.original_md_path).exists()
         )
-        if md_alive:
+        if md_alive and record and record.normalized_text:
             self._task_store.update_progress(
                 task_id,
                 status=TASK_STATUS_FAILED_RETRYABLE,
                 message=f"处理失败（可重试）：{exc}",
                 error=str(exc),
             )
-            logger.info("Task %s marked failed_retryable (md still on disk)", task_id)
         else:
             self._task_store.update_progress(
                 task_id,
@@ -305,28 +871,51 @@ class TaskManager:
                 message=f"处理失败（不可重试）：{exc}",
                 error=str(exc),
             )
-            logger.warning("Task %s marked error (no md for retry)", task_id)
+
+    def _mark_subtitle_pending(self, task_id: str, subtitle_error: str) -> None:
+        """把任务置为 subtitle_pending。
+
+        音频 bytes 已由 pipeline 内部写到 task_dir/<task_id>.mp3，
+        这里只需把 TaskStore.status 切到 subtitle_pending。
+        """
+        record = self._task_store.get(task_id)
+        date_str = record.date_str if record else None
+        self._task_store.mark_subtitle_pending(
+            task_id, date_str=date_str or "", subtitle_error=subtitle_error,
+        )
+        logger.warning(
+            "convert_task %s 字幕拉取失败，转 subtitle_pending: %s",
+            task_id, subtitle_error,
+        )
 
     def _apply_event(self, task_id: str, event: ProgressEvent) -> None:
         """将单个 ProgressEvent 转写为 TaskStore 更新。"""
         if event.stage == "error":
-            # pipeline 主动 yield error：与 _mark_failed 同语义
             self._mark_failed(task_id, RuntimeError(event.error or event.message or "error"))
         elif event.stage == "done":
+            # 字幕待重试：跳过（外层 _do_convert 已调 _mark_subtitle_pending）
+            if event.subtitle_status == "pending":
+                return
             self._task_store.update_progress(
                 task_id,
                 status=TASK_STATUS_DONE,
                 current_stage="done",
                 progress=1.0,
                 message=event.message,
-                audio_id=event.audio_id,
                 clear_error=True,
             )
         else:
             self._task_store.update_progress(
                 task_id,
-                status=TASK_STATUS_PROCESSING,
+                status=TASK_STATUS_CONVERTING,
                 current_stage=event.stage,
                 progress=event.progress,
                 message=event.message or "",
             )
+
+    @staticmethod
+    def _decode(raw: bytes) -> str:
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return raw.decode("gbk", errors="ignore")

@@ -1,4 +1,4 @@
-"""FastAPI application entry point.
+"""FastAPI application entry point (v4: task_id 一统天下；彻底 greenfield).
 
 Run with:
     D:\\anaconda3\\python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
@@ -22,20 +22,18 @@ from fastapi import FastAPI, Response
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.config import PROVIDER_EDGE, PROVIDER_MIMO, PROVIDERS, get_settings
+from app.config import PROVIDER_EDGE, PROVIDER_MINIMAX, PROVIDERS, get_settings
 from app.routers import tts as tts_router
 from app.services.audio_storage import (
     AudioStorageService,
-    LibraryStore,
     SettingsStore,
     TaskStore,
 )
 from app.services.edge_tts_provider import EdgeTtsClient
 from app.services.llm_normalizer import LlmNormalizer
-from app.services.markdown_service import MarkdownService
+from app.services.minimax_tts_provider import MinimaxTtsClient
 from app.services.pipeline import TtsPipeline
 from app.services.task_watchdog import StallWatchdog
-from app.services.tts_client import TtsClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,33 +48,30 @@ async def lifespan(app: FastAPI):
     logger.info("Starting %s on http://%s:%d", settings.app_name, settings.host, settings.port)
     logger.info(
         "TTS: model=%s base=%s key_set=%s",
-        settings.tts.model, settings.tts.base_url, bool(settings.tts.api_key),
+        settings.minimax.model, settings.minimax.base_url,
+        bool(settings.minimax.api_key or settings.llm.api_key),
     )
     logger.info(
         "M3 : model=%s base=%s key_set=%s",
         settings.llm.model, settings.llm.base_url, bool(settings.llm.api_key),
     )
 
-    md_svc = MarkdownService()
+    md_svc = None  # v5 起移除本地 Markdown 清洗：原始 MD 直接送 M3
     llm_svc = LlmNormalizer(settings.llm)
-    tts_client = TtsClient(settings.tts)
+    # 默认方案：MiniMax speech-2.8-hd。api_key 留空时回落 LLM__API_KEY（同平台共用）
+    minimax_client = MinimaxTtsClient(
+        settings.minimax,
+        api_key_fallback=settings.llm.api_key,
+    )
     audio_svc = AudioStorageService(Path(settings.output_dir).resolve())
-    library_svc = LibraryStore(
-        Path(settings.output_dir).resolve() / settings.library_db_filename
-    )
-    task_svc = TaskStore(
-        Path(settings.output_dir).resolve() / settings.library_db_filename
-    )
-    settings_db = SettingsStore(
-        Path(settings.output_dir).resolve() / settings.library_db_filename
-    )
-    # LyricsService 已移除：edge provider 自身产出 srt/lrc，详情页用
-    # ``audio_records.lyrics_path``（旧数据兼容）+ 现有 lrc_parser 即可。
+    # tasks 表与 app_settings 表共享同一个 SQLite 文件（不再有 audio_records 表）
+    db_path = Path(settings.output_dir).resolve() / settings.library_db_filename
+    task_svc = TaskStore(db_path)
+    settings_db = SettingsStore(db_path)
 
-    # 方案二：edge-tts 客户端 + ffmpeg 路径
+    # 备选 edge-tts：需要本地 ffmpeg
     ffmpeg_path = Path(settings.edge.ffmpeg_path).resolve()
     ffprobe_path = Path(settings.edge.ffprobe_path).resolve()
-    # 容器/Docker 场景：PATH 里能找到 ffmpeg 直接用
     if not ffmpeg_path.exists():
         import shutil
         on_path = shutil.which("ffmpeg")
@@ -101,11 +96,9 @@ async def lifespan(app: FastAPI):
 
     def build_pipeline(provider: str) -> TtsPipeline:
         return TtsPipeline(
-            markdown=md_svc,
             llm=llm_svc,
-            tts=tts_client,
             audio=audio_svc,
-            library=library_svc,
+            minimax_tts=minimax_client,
             edge_tts=edge_client,
             ffmpeg_path=ffmpeg_path if ffmpeg_path.exists() else None,
             ffprobe_path=ffprobe_path if ffprobe_path.exists() else None,
@@ -116,22 +109,17 @@ async def lifespan(app: FastAPI):
     pipelines = {p: build_pipeline(p) for p in PROVIDERS}
 
     tts_router.configure(
-        markdown=md_svc,
         llm=llm_svc,
-        tts=tts_client,
         audio=audio_svc,
-        library=library_svc,
         task_store=task_svc,
         settings_store=settings_db,
         pipelines=pipelines,
         active_provider=current_provider,
     )
 
-    app.state.markdown = md_svc
     app.state.llm = llm_svc
-    app.state.tts = tts_client
+    app.state.minimax_tts = minimax_client
     app.state.audio = audio_svc
-    app.state.library = library_svc
     app.state.task_store = task_svc
     app.state.settings_store = settings_db
     app.state.edge_tts = edge_client
@@ -140,7 +128,7 @@ async def lifespan(app: FastAPI):
     app.state.pipelines = pipelines
     app.state.active_provider = current_provider
 
-    # 后台任务看门狗：扫描 status='processing' 且 updated_at 超过
+    # 后台任务看门狗：扫描 status='converting' 且 updated_at 超过
     # task_stall_timeout_sec 没动过的任务，自动标 failed_retryable。
     watchdog = StallWatchdog(
         task_store=task_svc,
@@ -156,7 +144,7 @@ async def lifespan(app: FastAPI):
     finally:
         await watchdog.stop()
         await llm_svc.aclose()
-        await tts_client.aclose()
+        await minimax_client.aclose()
         if edge_client is not None:
             await edge_client.aclose()
         logger.info("Shutdown complete.")
@@ -166,8 +154,11 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
         title="txt2tts",
-        description="Read any .md aloud via MiniMax M3 (normalize) + MiniMax Speech 2.8 (TTS).",
-        version="0.2.0",
+        description=(
+            "Read any .md aloud via MiniMax M3 (normalize) + "
+            "MiniMax speech-2.8-hd (TTS, supports native SRT subtitles)."
+        ),
+        version="0.4.0",
         lifespan=lifespan,
     )
 

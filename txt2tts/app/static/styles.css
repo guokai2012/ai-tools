@@ -242,6 +242,17 @@ textarea:focus { border-color: var(--primary); }
 
 .btn-ghost { background: transparent; }
 
+/* v6: 中等强调按钮（清洗 / 重新拆分 / 重新清洗） */
+.btn-secondary {
+  background: rgba(124, 138, 255, 0.12);
+  border-color: rgba(124, 138, 255, 0.45);
+  color: var(--accent, #7c8aff);
+}
+.btn-secondary:hover {
+  background: rgba(124, 138, 255, 0.22);
+  border-color: var(--accent, #7c8aff);
+}
+
 .btn-mini {
   padding: 4px 10px;
   font-size: 12px;
@@ -377,6 +388,27 @@ audio {
   color: var(--ok);
 }
 
+/* state: warn（subtitle_pending 时 audio_save 阶段：半成功） */
+.step.warn .step-icon {
+  background: #f0ad4e;
+  border-color: #f0ad4e;
+  color: white;
+}
+.step.warn .step-icon::after {
+  content: "!";
+  position: absolute;
+  font-size: 16px;
+  font-weight: bold;
+}
+.step.warn .step-icon {
+  font-size: 0;
+}
+.step.warn .step-label {
+  color: #f0ad4e;
+}
+.step-bar.warn { background: #f0ad4e; }
+.step-bar.warn::after { background: #f0ad4e; }
+
 /* filled connector bar */
 .step-bar.done::after,
 .step-bar.active::after {
@@ -411,6 +443,10 @@ audio {
 
 .progress-message[data-kind="error"] {
   color: var(--err);
+}
+
+.progress-message[data-kind="warning"] {
+  color: #f0ad4e;
 }
 
 .progress-message[data-kind="success"] {
@@ -703,6 +739,17 @@ audio {
   animation: pulse-badge 1.5s ease-in-out infinite;
 }
 .task-item .badge-pending { color: var(--text-dim); }
+/* 新状态机徽章 */
+.task-item .badge-draft {
+  color: var(--text-dim);
+  border-color: var(--border);
+  background: var(--bg-soft);
+}
+.task-item .badge-ready {
+  color: var(--ok);
+  border-color: rgba(46, 204, 113, 0.3);
+  background: rgba(46, 204, 113, 0.08);
+}
 
 @keyframes pulse-badge {
   0%, 100% { opacity: 1; }
@@ -845,6 +892,175 @@ audio {
    详情页 LRC 由 edge provider 自动产出，在 .lyric-mode 下直接渲染。
    见 styles.css 中 .play-content.lyric-mode 区块。 */
 
+/* ---- 任务详情：分步交互式操作面板（v3）-------------------------------- */
+.task-step-panel {
+  margin-top: 18px;
+  padding: 16px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.task-step-panel h3 {
+  margin: 0 0 8px 0;
+  font-size: 16px;
+  color: var(--text);
+}
+.task-step-panel .text-preview {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  white-space: pre-wrap;
+  max-height: 200px;
+  overflow: auto;
+  margin-top: 6px;
+}
+.task-step-panel .split-prompt-textarea {
+  width: 100%;
+  margin-top: 8px;
+  padding: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  resize: vertical;
+}
+.task-step-panel .split-prompt-textarea:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(79, 140, 255, 0.18);
+}
+.task-step-panel .preset-row .btn {
+  font-size: 12px;
+}
+.task-step-panel .chunk-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 480px;
+  overflow-y: auto;
+}
+.task-step-panel .chunk-item {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+}
+.task-step-panel .chunk-item summary {
+  cursor: pointer;
+  font-size: 14px;
+  user-select: none;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.task-step-panel .chunk-item summary::before {
+  content: "▶";
+  font-size: 10px;
+  color: var(--text-dim);
+  transition: transform 0.15s;
+}
+.task-step-panel .chunk-item[open] summary::before {
+  transform: rotate(90deg);
+}
+.task-step-panel .chunk-textarea {
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  background: var(--bg-soft);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  resize: vertical;
+  min-height: 80px;
+}
+.task-step-panel .convert-summary {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.task-step-panel .convert-summary li {
+  padding: 4px 0;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+.task-step-panel .convert-summary li strong {
+  color: var(--text);
+}
+
+/* ---- v6 本地清洗：复选框 + 已应用标签 ----------------------------------- */
+.task-step-panel .clean-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.task-step-panel .clean-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--panel-2, rgba(255,255,255,0.04));
+  border: 1px solid var(--border, rgba(255,255,255,0.1));
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.task-step-panel .clean-option:hover {
+  background: rgba(124, 138, 255, 0.08);
+  border-color: var(--accent, #7c8aff);
+}
+.task-step-panel .clean-option input[type="checkbox"] {
+  margin-top: 2px;
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: var(--accent, #7c8aff);
+}
+.task-step-panel .clean-option-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  display: block;
+}
+.task-step-panel .clean-option-desc {
+  font-size: 11px;
+  color: var(--text-dim, rgba(255,255,255,0.55));
+  margin-top: 2px;
+  display: block;
+  line-height: 1.4;
+}
+.task-step-panel .clean-applied {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.task-step-panel .clean-tag {
+  display: inline-block;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--success, #4ade80);
+  background: rgba(74, 222, 128, 0.1);
+  border: 1px solid rgba(74, 222, 128, 0.3);
+  border-radius: 999px;
+}
+/* 小屏：复选框单列堆叠 */
+@media (max-width: 720px) {
+  .task-step-panel .clean-options {
+    grid-template-columns: 1fr;
+  }
+}
+
+
 /* ---- Provider 徽章 ----------------------------------------------------- */
 .provider-badge {
   display: inline-block;
@@ -857,7 +1073,7 @@ audio {
   text-transform: uppercase;
   vertical-align: middle;
 }
-.provider-badge.provider-mimo {
+.provider-badge.provider-minimax {
   background: rgba(79, 140, 255, 0.15);
   color: var(--primary);
   border: 1px solid rgba(79, 140, 255, 0.35);
@@ -1130,7 +1346,7 @@ html {
 }
 
 /* ---- 任务详情步骤条：≥900px 横向，<900px 改为纵向 ------------------------------ */
-/* 注意：mimo provider 是 6 步，6 步横向需要更宽的窗口；
+/* 注意：minimax provider 是 6 步，6 步横向需要更宽的窗口；
    此规则提前到 900px 触发纵向堆叠，避免挤压。整体页面移动布局仍以 720px 为准。 */
 @media (max-width: 900px) {
   .step-progress {
@@ -1269,4 +1485,58 @@ html {
   .topbar h1 { font-size: 16px; }
   .menu-item { padding: 6px 10px; font-size: 13px; }
   .card { padding: 12px; }
+}
+
+/* ---- 任务详情 step panel 移动端适配 ----------------------------------- */
+@media (max-width: 720px) {
+  .task-step-panel {
+    padding: 12px;
+  }
+  .task-step-panel .split-prompt-textarea {
+    font-size: 14px;     /* iOS 防止自动放大 */
+  }
+  .task-step-panel .chunk-textarea {
+    font-size: 14px;
+  }
+  .task-step-panel .row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .task-step-panel .row .btn {
+    width: 100%;
+    min-height: 44px;
+  }
+  .task-step-panel .preset-row {
+    gap: 4px;
+  }
+  .task-step-panel .preset-row .btn {
+    font-size: 11px;
+    padding: 4px 8px;
+  }
+}
+/* ---- v4: 删除对话框 / LRC 徽章 ----------------------------------------- */
+.btn-danger {
+  background: #d9534f;
+  color: #fff;
+  border-color: #d9534f;
+}
+.btn-danger:hover:not(:disabled) {
+  background: #c9302c;
+  border-color: #c9302c;
+}
+.btn-danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.lrc-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 999px;
+  margin-right: 4px;
+  background: rgba(46, 204, 113, 0.15);
+  color: var(--ok);
+  border: 1px solid rgba(46, 204, 113, 0.35);
+  letter-spacing: 0.4px;
 }

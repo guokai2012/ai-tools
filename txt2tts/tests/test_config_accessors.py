@@ -16,12 +16,13 @@ import pytest
 
 from app.config import (
     M3_SYSTEM_PROMPT,
+    MINIMAX_VOICES_ZH,
     SEMANTIC_PREPROCESS_PROMPT,
     SPLIT_SYSTEM_PROMPT,
     EdgeTtsSettings,
     get_edge_voices,
     get_m3_system_prompt,
-    get_mimo_voices,
+    get_minimax_voices,
     get_semantic_preprocess_prompt,
     get_split_system_prompt,
     reset_settings_cache,
@@ -97,47 +98,49 @@ def test_get_semantic_preprocess_prompt_env_override(monkeypatch: pytest.MonkeyP
     assert get_semantic_preprocess_prompt() == new_prompt
 
 
-# ---- get_mimo_voices ------------------------------------------------------
+# ---- get_minimax_voices ---------------------------------------------------
 
 
-def test_get_mimo_voices_default_returns_static_list():
-    voices = get_mimo_voices()
-    assert isinstance(voices, list) and len(voices) == 9
-    # 默认应当含 mimo_default
+def test_get_minimax_voices_default_returns_static_list():
+    voices = get_minimax_voices()
+    assert isinstance(voices, list)
+    # 默认应当含一些真实 voice_id
     ids = {v["id"] for v in voices}
-    assert "mimo_default" in ids
+    assert "male-qn-qingse" in ids
+    # 默认条数等于 MINIMAX_VOICES_ZH
+    assert len(voices) == len(MINIMAX_VOICES_ZH)
 
 
-def test_get_mimo_voices_env_override(monkeypatch: pytest.MonkeyPatch):
+def test_get_minimax_voices_env_override(monkeypatch: pytest.MonkeyPatch):
     custom = json.dumps([
         {"id": "test_voice_1", "name": "测试 1", "lang": "zh"},
         {"id": "test_voice_2", "name": "测试 2", "lang": "en"},
     ])
-    monkeypatch.setenv("APP__MIMO_VOICES_JSON", custom)
+    monkeypatch.setenv("APP__MINIMAX_VOICES_JSON", custom)
     reset_settings_cache()
-    voices = get_mimo_voices()
+    voices = get_minimax_voices()
     assert len(voices) == 2
     assert voices[0]["id"] == "test_voice_1"
     assert voices[1]["lang"] == "en"
 
 
-def test_get_mimo_voices_env_invalid_json_falls_back(monkeypatch: pytest.MonkeyPatch, caplog):
-    monkeypatch.setenv("APP__MIMO_VOICES_JSON", "{not valid json")
+def test_get_minimax_voices_env_invalid_json_falls_back(monkeypatch: pytest.MonkeyPatch, caplog):
+    monkeypatch.setenv("APP__MINIMAX_VOICES_JSON", "{not valid json")
     reset_settings_cache()
     with caplog.at_level("WARNING"):
-        voices = get_mimo_voices()
+        voices = get_minimax_voices()
     # 兜底默认
-    assert len(voices) == 9
-    assert "APP__MIMO_VOICES_JSON 解析失败" in caplog.text
+    assert len(voices) == len(MINIMAX_VOICES_ZH)
+    assert "APP__MINIMAX_VOICES_JSON 解析失败" in caplog.text
 
 
-def test_get_mimo_voices_env_not_list_falls_back(monkeypatch: pytest.MonkeyPatch, caplog):
+def test_get_minimax_voices_env_not_list_falls_back(monkeypatch: pytest.MonkeyPatch, caplog):
     """JSON 合法但不是 list → 兜底。"""
-    monkeypatch.setenv("APP__MIMO_VOICES_JSON", json.dumps({"id": "x"}))
+    monkeypatch.setenv("APP__MINIMAX_VOICES_JSON", json.dumps({"id": "x"}))
     reset_settings_cache()
     with caplog.at_level("WARNING"):
-        voices = get_mimo_voices()
-    assert len(voices) == 9
+        voices = get_minimax_voices()
+    assert len(voices) == len(MINIMAX_VOICES_ZH)
     assert "回落默认" in caplog.text
 
 
@@ -177,18 +180,18 @@ def test_get_edge_voices_env_invalid_json_falls_back(monkeypatch: pytest.MonkeyP
 def test_accessors_are_cached(monkeypatch: pytest.MonkeyPatch):
     """连续两次调用应当返回**同一对象**（lru_cache 命中）。"""
     reset_settings_cache()
-    a = get_mimo_voices()
-    b = get_mimo_voices()
+    a = get_minimax_voices()
+    b = get_minimax_voices()
     # list() 在 accessor 内部 list(...) 已复制，但 lru_cache 仍缓存 list 对象
     # 即使内容相等也不一定是同一对象；这里只验"内容一致"
     assert a == b
     # 修改 env + reset 之前：accessor 仍返回旧值
-    monkeypatch.setenv("APP__MIMO_VOICES_JSON", json.dumps([{"id": "x", "name": "x", "lang": "x"}]))
-    c = get_mimo_voices()
+    monkeypatch.setenv("APP__MINIMAX_VOICES_JSON", json.dumps([{"id": "x", "name": "x", "lang": "x"}]))
+    c = get_minimax_voices()
     assert c == a  # 缓存命中，未重读 env
     # reset 后再读：拿到 env 覆盖
     reset_settings_cache()
-    d = get_mimo_voices()
+    d = get_minimax_voices()
     assert len(d) == 1 and d[0]["id"] == "x"
 
 
@@ -298,13 +301,14 @@ def test_pipeline_helper_reads_from_edge_settings():
     from app.services.pipeline import TtsPipeline
     es = EdgeTtsSettings(ffmpeg_concat_timeout_sec=99.0, mimo_ffmpeg_concat_timeout_sec=88.0)
     pipe = TtsPipeline(
-        markdown=None, llm=None, tts=None, audio=None,
-        edge_tts=None, ffmpeg_path=None, ffprobe_path=None,
+         llm=None, audio=None,
+        edge_tts=None, minimax_tts=None,
+        ffmpeg_path=None, ffprobe_path=None,
         edge_settings=es,
     )
     assert pipe._probe_timeout() == 10.0  # default
     assert pipe._edge_concat_timeout() == 99.0
-    assert pipe._mimo_concat_timeout() == 88.0
+    assert pipe._minimax_concat_timeout() == 88.0
 
 
 def test_pipeline_helper_falls_back_to_edge_client_settings():
@@ -313,8 +317,9 @@ def test_pipeline_helper_falls_back_to_edge_client_settings():
     fake_client = MagicMock()
     fake_client._settings = EdgeTtsSettings(ffmpeg_concat_timeout_sec=55.0)
     pipe = TtsPipeline(
-        markdown=None, llm=None, tts=None, audio=None,
-        edge_tts=fake_client, ffmpeg_path=None, ffprobe_path=None,
+         llm=None, audio=None,
+        edge_tts=fake_client, minimax_tts=None,
+        ffmpeg_path=None, ffprobe_path=None,
     )
     assert pipe._edge_concat_timeout() == 55.0
 
@@ -323,9 +328,10 @@ def test_pipeline_helper_fallback_default():
     """既没 edge_settings 也没 edge_tts → 兜底默认。"""
     from app.services.pipeline import TtsPipeline
     pipe = TtsPipeline(
-        markdown=None, llm=None, tts=None, audio=None,
-        edge_tts=None, ffmpeg_path=None, ffprobe_path=None,
+         llm=None, audio=None,
+        edge_tts=None, minimax_tts=None,
+        ffmpeg_path=None, ffprobe_path=None,
     )
     assert pipe._probe_timeout() == 10.0
     assert pipe._edge_concat_timeout() == 120.0
-    assert pipe._mimo_concat_timeout() == 600.0
+    assert pipe._minimax_concat_timeout() == 600.0

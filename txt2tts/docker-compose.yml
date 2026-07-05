@@ -1,7 +1,8 @@
 # docker-compose.yml —— 单服务部署 txt2tts
 #
 # 用法：
-#   1. cp .env.example .env，填入 LLM__API_KEY / TTS__API_KEY
+#   1. cp .env.example .env，填入 LLM__API_KEY（MINIMAX 与 LLM 共用 key）
+#      如 TTS 用独立 key 也可填 MINIMAX__API_KEY
 #   2. docker compose up -d --build
 #   3. 浏览器访问 http://localhost:8000
 #
@@ -21,7 +22,7 @@ services:
     ports:
       - "8000:8000"           # 浏览器访问 http://localhost:8000
     env_file:
-      - .env                 # 读取 LLM__API_KEY / TTS__API_KEY 等
+      - .env                 # 读取 LLM__API_KEY / MINIMAX__API_KEY 等
     environment:
       # 容器里默认 host 是 0.0.0.0（已在 Dockerfile CMD 设置）
       APP__HOST: "0.0.0.0"
@@ -29,9 +30,13 @@ services:
       APP__OUTPUT_DIR: "/app/outputs"
       APP__STATIC_DIR: "/app/app/static"
       APP__LIBRARY_DB_FILENAME: "library.db"
-      # TTS Provider 切换（默认 mimo；想用 edge 把下面改成 edge）
-      APP__TTS_PROVIDER: "mimo"
-      # edge-tts 方案二：ffmpeg / ffprobe 在容器 /usr/local/bin/ 下
+      # TTS Provider 切换（默认 minimax，与 M3 同厂商 + 原生字幕；
+      # 想用 edge-tts 把下面改成 edge）
+      APP__TTS_PROVIDER: "minimax"
+      # MiniMax speech-2.8-hd TTS（容器里走内网；本地开发用 .env）
+      MINIMAX__BASE_URL: "https://api.minimaxi.com"
+      MINIMAX__T2A_PATH: "/v1/t2a_v2"
+      # edge-tts 备选：ffmpeg / ffprobe 在容器 /usr/local/bin/ 下
       EDGE__FFMPEG_PATH: "/usr/local/bin/ffmpeg"
       EDGE__FFPROBE_PATH: "/usr/local/bin/ffprobe"
       EDGE__DEFAULT_VOICE: "zh-CN-XiaoxiaoNeural"

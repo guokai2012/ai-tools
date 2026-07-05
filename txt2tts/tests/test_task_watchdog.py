@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 
 from app.services.audio_storage import (
+    TASK_STATUS_CONVERTING,
     TASK_STATUS_FAILED_RETRYABLE,
-    TASK_STATUS_PROCESSING,
     TaskRecord,
     TaskStore,
 )
@@ -18,7 +18,7 @@ from app.services.task_watchdog import StallWatchdog, _parse_iso
 # ---- helpers --------------------------------------------------------------
 
 
-def _task(task_id: str, *, status: str = TASK_STATUS_PROCESSING,
+def _task(task_id: str, *, status: str = TASK_STATUS_CONVERTING,
           current_stage: str = "tts_synthesize",
           progress: float = 0.5,
           updated_at: str = "2026-07-02T00:00:00Z") -> TaskRecord:
@@ -30,7 +30,7 @@ def _task(task_id: str, *, status: str = TASK_STATUS_PROCESSING,
         current_stage=current_stage,
         progress=progress,
         message="m",
-        audio_id=None,
+        date_str="20260704",
         error=None,
         created_at=updated_at,
         updated_at=updated_at,
@@ -64,9 +64,9 @@ def test_parse_iso_invalid_returns_zero():
 
 def test_task_store_list_processing_filters_status(tmp_path: Path):
     store = TaskStore(tmp_path / "tasks.db")
-    store.insert(_task("a", status=TASK_STATUS_PROCESSING))
+    store.insert(_task("a", status=TASK_STATUS_CONVERTING))
     store.insert(_task("b", status="done"))
-    store.insert(_task("c", status=TASK_STATUS_PROCESSING))
+    store.insert(_task("c", status=TASK_STATUS_CONVERTING))
     items = store.list_processing()
     assert {r.task_id for r in items} == {"a", "c"}
 
@@ -129,7 +129,7 @@ def test_watchdog_tick_ignores_fresh_tasks(tmp_path: Path):
     )
     killed = wd.tick()
     assert killed == 0
-    assert store.get("fresh").status == TASK_STATUS_PROCESSING
+    assert store.get("fresh").status == TASK_STATUS_CONVERTING
 
 
 def test_watchdog_tick_ignores_non_processing(tmp_path: Path):
@@ -187,7 +187,7 @@ def test_watchdog_tick_multiple_tasks(tmp_path: Path):
     assert killed == 2
     assert store.get("stale1").status == TASK_STATUS_FAILED_RETRYABLE
     assert store.get("stale2").status == TASK_STATUS_FAILED_RETRYABLE
-    assert store.get("alive").status == TASK_STATUS_PROCESSING
+    assert store.get("alive").status == TASK_STATUS_CONVERTING
 
 
 def test_watchdog_invalid_threshold_raises(tmp_path: Path):

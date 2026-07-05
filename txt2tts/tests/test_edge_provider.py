@@ -279,7 +279,7 @@ from app.services.pipeline import TtsPipeline
 def test_pipeline_resolve_edge_voice_accepts_valid():
     from app.services.edge_tts_provider import EdgeTtsClient
     pipe = TtsPipeline(
-        markdown=None, llm=None, tts=None, audio=None,
+         llm=None, audio=None,
         edge_tts=EdgeTtsClient(_settings()),
     )
     assert pipe._resolve_edge_voice("zh-CN-YunxiNeural") == "zh-CN-YunxiNeural"
@@ -288,7 +288,7 @@ def test_pipeline_resolve_edge_voice_accepts_valid():
 def test_pipeline_resolve_edge_voice_falls_back_for_mimo_voice(caplog):
     from app.services.edge_tts_provider import EdgeTtsClient
     pipe = TtsPipeline(
-        markdown=None, llm=None, tts=None, audio=None,
+         llm=None, audio=None,
         edge_tts=EdgeTtsClient(_settings()),
     )
     with caplog.at_level("WARNING"):
@@ -300,7 +300,7 @@ def test_pipeline_resolve_edge_voice_falls_back_for_mimo_voice(caplog):
 def test_pipeline_resolve_edge_voice_falls_back_for_none():
     from app.services.edge_tts_provider import EdgeTtsClient
     pipe = TtsPipeline(
-        markdown=None, llm=None, tts=None, audio=None,
+         llm=None, audio=None,
         edge_tts=EdgeTtsClient(_settings()),
     )
     assert pipe._resolve_edge_voice(None) == "zh-CN-XiaoxiaoNeural"
@@ -310,7 +310,7 @@ def test_pipeline_resolve_edge_voice_falls_back_for_none():
 def test_pipeline_resolve_edge_voice_falls_back_for_unknown_voice(caplog):
     from app.services.edge_tts_provider import EdgeTtsClient
     pipe = TtsPipeline(
-        markdown=None, llm=None, tts=None, audio=None,
+         llm=None, audio=None,
         edge_tts=EdgeTtsClient(_settings()),
     )
     with caplog.at_level("WARNING"):
